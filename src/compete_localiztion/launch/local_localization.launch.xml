@@ -1,0 +1,14 @@
+<launch>
+
+    <!-- Extended Kalman Filter -->
+    <node
+        pkg="robot_localization"
+        exec="ekf_node"
+        name="ekf_filter_node"
+        output="screen">
+
+        <param from="$(find-pkg-share compete_localiztion)/config/ekf.yaml" />
+
+    </node>
+
+</launch>
