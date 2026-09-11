@@ -1,6 +1,5 @@
 # AutoDRIVE Roboracer: Filtered Odometry Setup
 
-This guide outlines the complete and "dangerous" sequence of steps to build the custom Docker environment, run the AutoDRIVE simulator, and launch the filtered odometry for the Roboracer.
 
 ## 1. Docker Setup & Build
 
