@@ -3,7 +3,7 @@
 
 ## 1. Docker Setup & Build
 
-First, create the Docker folder and the Dockerfile. As seen in `Screenshot from 2026-09-11 16-34-25.png`, you can either name your file `roboracer_localization` or simply `Dockerfile` as standard.
+First, create the Docker folder and the Dockerfile.
 
 ```bash
 mkdir autodrive_roboracer_docker
