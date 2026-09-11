@@ -6,6 +6,8 @@ docker run --name autodrive_roboracer_sim --rm -it --entrypoint /bin/bash --netw
 
 ./AutoDRIVE\ Simulator.x86_64 -batchmode -nographics -ip 127.0.0.1 -port 4567
 
+#DEVKIT
+
 docker run \
   --name autodrive_roboracer_api \
   --rm -it \
@@ -20,14 +22,9 @@ docker run \
   --privileged \
   roboracer_localization:latest
 
-ros2 launch roboracer_bringup controller_only_pure.launch.xml 
-
 
 docker exec -it autodrive_roboracer_api bash 
 
-
-ros2 run roboracer_controller ackermann_motion_planning.py --ros-args -p waypoint_file:=/home/autodrive_devkit/src/roboracer_controller/maps/raceline_approved.csv
-
-ros2 launch roboracer_controller run_RPP.launch.xml
+ros2 launch compete_bringup odom_filterd.launch.xml 
 
 """
