@@ -1,0 +1,44 @@
+<launch>
+
+    <!-- 1. Robot / Graphics Bringup (t = 0s) -->
+    <include file="$(find-pkg-share autodrive_roboracer)/launch/bringup_graphics.launch.py">
+    </include>
+
+    <!-- 2. Ackermann Odometry (t = 1s) -->
+    <timer period="1.0">
+        <node
+            pkg="compete_localiztion"
+            exec="ackermann_odom.py"
+            name="ackermann_odom"
+            output="screen">
+        </node>
+    </timer>
+
+    <!-- 3. RF2O Laser Odometry (t = 2s) -->
+    <timer period="2.0">
+        <include file="$(find-pkg-share rf2o_laser_odometry)/launch/compete_laser_odom.launch.py">
+        </include>
+    </timer>
+
+    <!-- 4. Localization (EKF) (t = 3s) -->
+    <timer period="3.0">
+        <include file="$(find-pkg-share compete_localiztion)/launch/local_localization.launch.xml">
+        </include>
+    </timer>
+
+    <!-- 5. Static TF Bridge (t = 0s — no deps) -->
+    <node
+        pkg="tf2_ros"
+        exec="static_transform_publisher"
+        name="map_world_tf"
+        args="0 0 0 0 0 0 map world"
+        output="screen">
+    </node>
+
+    <!-- 6. Particle Filter (t = 4s) -->
+    <timer period="4.0">
+        <include file="$(find-pkg-share particle_filter)/launch/localize_launch.py">
+        </include>
+    </timer>
+
+</launch>
