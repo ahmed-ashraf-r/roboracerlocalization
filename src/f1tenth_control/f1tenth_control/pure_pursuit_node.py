@@ -63,7 +63,7 @@ class PurePursuitNode(Node):
         self.wheelbase = 0.324             # meters (L)
         self.max_steer_rad = 0.5236        # max steering angle (~30 deg)
         self.lookahead_distance = 0.95     # fixed lookahead distance (Ld)
-        self.constant_throttle = 0.15       # fixed forward throttle
+        self.constant_throttle = 0.155       # fixed forward throttle
 
         # Load raceline CSV (Columns: 0=X, 1=Y, 2=Speed)
         csv_path = '/home/autodrive_devkit/src/f1tenth_control/practice_iros_2026.csv'
