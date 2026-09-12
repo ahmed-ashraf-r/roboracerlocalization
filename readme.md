@@ -92,7 +92,7 @@ Inside the simulator container:
 ## 3. Run the Devkit & Localization Stack
 
 Open a new terminal and start the API/Devkit container:
-NOT ghange user name and workspace to match your PC "/home/ubuntu/roboracer_compet_ws " 
+NOTE ghange user name and workspace to match your PC "/home/ubuntu/roboracer_compet_ws " 
 change that to your PC
 
 ```bash
