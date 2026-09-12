@@ -20,7 +20,7 @@ docker run \
   -v /home/ubuntu/roboracer_compet_ws/src/rf2o_laser_odometry-ros2:/home/autodrive_devkit/src/rf2o_laser_odometry-ros2 \
   -v /home/ubuntu/roboracer_compet_ws/src/particle_filter:/home/autodrive_devkit/src/particle_filter \
   -v /home/ubuntu/roboracer_compet_ws/src/range_libc:/home/autodrive_devkit/src/range_libc \
-  -v /home/ubuntu/roboracer_compet_ws/src/compete_controller:/home/autodrive_devkit/src/compete_controller \
+  -v /home/ubuntu/roboracer_compet_ws/src/f1tenth_control:/home/autodrive_devkit/src/f1tenth_control \
   --env DISPLAY \
   --privileged \
   roboracer_localization:latest
