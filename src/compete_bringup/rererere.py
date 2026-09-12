@@ -28,7 +28,7 @@ docker run \
 
 docker exec -it autodrive_roboracer_api bash 
 
-ros2 launch compete_bringup odom_filterd.launch.xml 
+ros2 launch compete_bringup final_odom.launch.xml 
 
 """
 """
