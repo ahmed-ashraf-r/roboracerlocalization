@@ -41,4 +41,11 @@
         </include>
     </timer>
 
+    <!-- 7. Auto-Publish Initial Pose (t = 5s) -->
+    <timer period="5.0">
+        <executable
+            cmd="ros2 topic pub --once /initialpose geometry_msgs/msg/PoseWithCovarianceStamped '{header: {frame_id: map}, pose: {pose: {position: {x: 0.7994, y: 3.1583, z: 0.0}, orientation: {x: 0.0, y: 0.0, z: -0.7071, w: 0.7071}}, covariance: [0.25, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.25, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0685]}}'"
+            output="screen" />
+    </timer>
+
 </launch>
