@@ -30,4 +30,12 @@ docker exec -it autodrive_roboracer_api bash
 
 ros2 launch compete_bringup final_odom.launch.xml 
 
+
+docker run -it \
+  --name autodrive_roboracer_api \
+  --network=host \
+  --ipc=host \
+  --privileged \
+  mohamedelgohary978/assiut-motorsport-roboracer:qualification
+
 """

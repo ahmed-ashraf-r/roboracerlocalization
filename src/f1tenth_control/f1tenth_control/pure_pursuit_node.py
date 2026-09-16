@@ -1,157 +1,347 @@
 #!/usr/bin/env python3
-"""
-Simple Pure Pursuit Controller following the 4-step canonical logic:
-1. Find closest waypoint from filtered odom.
-2. Find target waypoint where distance >= fixed lookahead distance.
-3. Compute curvature (kappa) using fixed lookahead distance.
-4. Compute steering angle from curvature and wheelbase.
-"""
 
 import math
+
+import matplotlib.pyplot as plt
 import numpy as np
-
+import pandas as pd
 import rclpy
-from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
-
+from geometry_msgs.msg import Point
 from nav_msgs.msg import Odometry
+from rclpy.node import Node
+from scipy.spatial.transform import Rotation as R
+from sensor_msgs.msg import Imu
 from std_msgs.msg import Float32
 
 
-# =============================================================================
-# Helper Functions
-# =============================================================================
-
-def clip(value, low, high):
-    return max(low, min(high, value))
-
-
-def quaternion_to_yaw(q):
-    siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
-    cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-    return math.atan2(siny_cosp, cosy_cosp)
-
-
-def global_to_vehicle_frame(car_x, car_y, car_yaw, point_x, point_y):
-    dx = point_x - car_x
-    dy = point_y - car_y
-
-    c = math.cos(car_yaw)
-    s = math.sin(car_yaw)
-
-    # Local x (forward), local y (lateral to the left)
-    x_local = c * dx + s * dy
-    y_local = -s * dx + c * dy
-    return x_local, y_local
-
-
-# =============================================================================
-# Pure Pursuit Node
-# =============================================================================
-
 class PurePursuitNode(Node):
+    """
+    Pure Pursuit path tracker with feedforward throttle.
+
+    Throttle relation (from regression):
+        throttle_norm = 0.04131 * target_velocity_mps
+    """
+
+    # Path to CSV with columns [positions_X, positions_y, Velocity]
+    CSV_PATH = '/home/autodrive_devkit/src/f1tenth_control/practice_iros_2026.csv'
+
+    # Feedforward throttle gain
+    # If throttle command is 0-100 scale, change to 4.131
+    THROTTLE_RATIO = 0.04131
+
+    # Loop rate
+    DT = 0.01
+
+    # Pure Pursuit parameters
+    WHEELBASE = 0.3240
+    MAX_STEER = 0.5236
+
+    # Plot buffers
+    MAX_SPEED_POINTS = 750
+    PLOT_EVERY_N = 10
+
     def __init__(self):
-        super().__init__('pure_pursuit_node')
+        super().__init__('control_node')
 
-        # Real-time state from sensors
-        self.car_x = 0.81
-        self.car_y = 3.16
-        self.car_yaw = 4.71
-        self.have_odom = False
+        # ----- Car state -----
+        self.position = np.array([0.8, 3.16])
+        self.odom_position = np.array([0.8, 3.16])
+        self.odom_vel_x = 0.0
+        self.odom_vel_y = 0.0
+        self.odom_speed = 0.0
+        self.car_yaw = 0.0
 
-        # Vehicle and control parameters
-        self.wheelbase = 0.324             # meters (L)
-        self.max_steer_rad = 0.5236        # max steering angle (~30 deg)
-        self.lookahead_distance = 0.95     # fixed lookahead distance (Ld)
-        self.constant_throttle = 0.155       # fixed forward throttle
+        # ----- Path data -----
+        self._load_path()
 
-        # Load raceline CSV (Columns: 0=X, 1=Y, 2=Speed)
-        csv_path = '/home/autodrive_devkit/src/f1tenth_control/practice_iros_2026.csv'
-        data = np.genfromtxt(csv_path, delimiter=',', comments='#')
-        data = data[~np.isnan(data).any(axis=1)]
+        # ----- Pure Pursuit state -----
+        self.look_ahead = 2.0
+        self.count = self._initial_index()
+        self.speed_count = 0
+        self.search_len = self.path_len / 5
 
-        self.path_x = data[:, 0]
-        self.path_y = data[:, 1]
-        self.n_points = len(self.path_x)
+        # ----- Buffers for plotting -----
+        self.plot_counter = 0
+        self.car_trail_x = []
+        self.car_trail_y = []
+        self.ips_trail_x = []
+        self.ips_trail_y = []
+        self.sim_time = 0.0
+        self.time_log = []
+        self.target_speed_log = []
+        self.actual_speed_log = []
+        self.odom_velx_log = []
 
-        # Subscriptions
-        self.odom_sub = self.create_subscription(
-            Odometry,
-            '/pf/pose/odom',
-            self.odom_callback,
-            qos_profile_sensor_data
+        # ----- ROS interfaces -----
+        self._setup_ros_interfaces()
+
+        # ----- Matplotlib figures -----
+        self._setup_figures()
+
+        # ----- Main loop timer -----
+        self.timer = self.create_timer(self.DT, self.timer_callback)
+
+        self.get_logger().info('Pure Pursuit node started.')
+
+    # ------------------------------------------------------------------
+    # Setup
+    # ------------------------------------------------------------------
+
+    def _load_path(self):
+        path_data = pd.read_csv(
+            self.CSV_PATH,
+            header=None,
+            names=['positions_X', 'positions_y', 'Velocity'],
         )
+        goal_list = list(zip(path_data['positions_X'], path_data['positions_y']))
+        self.goal = np.array(goal_list)
+        self.path_len = len(self.goal)
+        self.vel_profile = path_data['Velocity'].to_numpy()
 
-        # Publishers
+    def _initial_index(self):
+        distances = np.sqrt(
+            (self.goal[:, 0] - self.position[0]) ** 2
+            + (self.goal[:, 1] - self.position[1]) ** 2
+        )
+        return int(np.argmin(distances))
+
+    def _setup_ros_interfaces(self):
+        self.create_subscription(
+            Odometry,
+            '/autodrive/roboracer_1/odom',
+            self.odom_callback,
+            10,
+        )
+        self.create_subscription(
+            Point,
+            '/autodrive/roboracer_1/ips',
+            self.ips_callback,
+            10,
+        )
+        self.create_subscription(
+            Imu,
+            '/autodrive/roboracer_1/imu',
+            self.yaw_callback,
+            10,
+        )
         self.steer_pub = self.create_publisher(
             Float32,
             '/autodrive/roboracer_1/steering_command',
-            10
+            10,
         )
         self.throttle_pub = self.create_publisher(
             Float32,
             '/autodrive/roboracer_1/throttle_command',
-            10
+            10,
         )
 
-        # 40 Hz control loop
-        self.timer = self.create_timer(1.0 / 40.0, self.control_loop)
-        self.get_logger().info('Pure Pursuit controller started cleanly.')
+    def _setup_figures(self):
+        plt.ion()
+
+        # Figure 1: tracking
+        self.fig, self.ax = plt.subplots(figsize=(8, 8))
+        self.ax.plot(self.goal[:, 0], self.goal[:, 1], 'k--', label='CSV Path')
+        (self.car_plot,) = self.ax.plot([], [], 'ro', ms=8, label='Current Pose')
+        (self.target_plot,) = self.ax.plot([], [], 'go', ms=8, label='Lookahead Point')
+        (self.trail_plot,) = self.ax.plot([], [], 'b-', lw=1.5, label='Actual Path')
+        (self.ips_plot,) = self.ax.plot([], [], 'm^', ms=8, label='Odom Pose')
+        (self.ips_trail_plot,) = self.ax.plot([], [], 'm-', lw=1.2, alpha=0.7, label='Odom Path')
+        self.ax.set_title('Pure Pursuit Tracking')
+        self.ax.set_xlabel('X [m]')
+        self.ax.set_ylabel('Y [m]')
+        self.ax.legend(loc='upper right')
+        self.ax.grid(True)
+        self.ax.axis('equal')
+        self.fig.canvas.draw()
+        self.fig.canvas.flush_events()
+
+        # Figure 2: speed
+        self.fig2, self.ax2 = plt.subplots(figsize=(8, 4))
+        (self.target_speed_plot,) = self.ax2.plot([], [], 'g-', lw=1.5, label='Target Speed')
+        (self.actual_speed_plot,) = self.ax2.plot([], [], 'b-', lw=1.5, label='Actual Speed')
+        (self.odom_velx_plot,) = self.ax2.plot([], [], 'r--', lw=1.2, label='Odom Vel X')
+        self.ax2.set_title('Speed Tracking')
+        self.ax2.set_xlabel('Time [s]')
+        self.ax2.set_ylabel('Speed [m/s]')
+        self.ax2.legend(loc='upper right')
+        self.ax2.grid(True)
+        self.fig2.canvas.draw()
+        self.fig2.canvas.flush_events()
+
+    # ------------------------------------------------------------------
+    # Callbacks
+    # ------------------------------------------------------------------
 
     def odom_callback(self, msg: Odometry):
-        # Extract position
-        self.car_x = msg.pose.pose.position.x
-        self.car_y = msg.pose.pose.position.y
-        
-        # Extract orientation and convert quaternion to yaw
-        self.car_yaw = quaternion_to_yaw(msg.pose.pose.orientation)
-        
-        self.have_odom = True
+        self.odom_position[0] = msg.pose.pose.position.x
+        self.odom_position[1] = msg.pose.pose.position.y
+        self.odom_vel_x = msg.twist.twist.linear.x
+        self.odom_vel_y = msg.twist.twist.linear.y
+        self.odom_speed = math.sqrt(self.odom_vel_x ** 2 + self.odom_vel_y ** 2)
 
-    def control_loop(self):
-        if not self.have_odom:
-            return
+    def ips_callback(self, msg: Point):
+        self.position[0] = msg.x
+        self.position[1] = msg.y
 
-        # Step 1: closest waypoint
-        distances = (self.path_x - self.car_x)**2 + (self.path_y - self.car_y)**2
-        closest_idx = int(np.argmin(distances))
+    def yaw_callback(self, msg: Imu):
+        q = [msg.orientation.x, msg.orientation.y, msg.orientation.z, msg.orientation.w]
+        _, _, self.car_yaw = R.from_quat(q).as_euler('xyz')
 
-        # Step 2: first point at least lookahead_distance away and ahead of car
-        target_idx = closest_idx
-        for _ in range(self.n_points):
-            dx = self.path_x[target_idx] - self.car_x
-            dy = self.path_y[target_idx] - self.car_y
-            dist = math.hypot(dx, dy)
+    # ------------------------------------------------------------------
+    # Pure Pursuit math
+    # ------------------------------------------------------------------
 
-            if dist >= self.lookahead_distance:
-                x_loc, y_loc = global_to_vehicle_frame(
-                    self.car_x, self.car_y, self.car_yaw,
-                    self.path_x[target_idx], self.path_y[target_idx]
-                )
-                if x_loc > 0.0:
-                    break
+    @staticmethod
+    def _to_car_frame(xy_world, point_world, yaw):
+        rot = np.array([
+            [np.cos(yaw), np.sin(yaw)],
+            [-np.sin(yaw), np.cos(yaw)],
+        ])
+        return rot @ (point_world - xy_world)
 
-            target_idx = (target_idx + 1) % self.n_points
+    def _curvature(self, xy_car_frame):
+        y = xy_car_frame[1]
+        return (2.0 * y) / (self.look_ahead ** 2)
 
-        target_x = self.path_x[target_idx]
-        target_y = self.path_y[target_idx]
+    def _steering_angle(self, curvature):
+        return np.arctan(self.WHEELBASE * curvature)
 
-        # Step 3: curvature
-        x_local, y_local = global_to_vehicle_frame(
-            self.car_x, self.car_y, self.car_yaw, target_x, target_y
+    # ------------------------------------------------------------------
+    # Feedforward throttle
+    # ------------------------------------------------------------------
+
+    def _feedforward_throttle(self, target_speed):
+        output = self.THROTTLE_RATIO * target_speed
+        return max(min(output, 1.0), 0.0)
+
+    # ------------------------------------------------------------------
+    # Lookahead search
+    # ------------------------------------------------------------------
+
+    def _update_lookahead_index(self):
+        start = self.count
+        search_end = min(self.count + int(self.search_len), self.path_len)
+
+        check_distance = np.sqrt(
+            (self.goal[start:search_end, 0] - self.position[0]) ** 2
+            + (self.goal[start:search_end, 1] - self.position[1]) ** 2
         )
-        kappa = 2.0 * y_local / (self.lookahead_distance ** 2)
 
-        # Step 4: steering
-        steering = math.atan(self.wheelbase * kappa)
-        steering = clip(steering, -self.max_steer_rad, self.max_steer_rad)
+        nearest = np.where(check_distance >= self.look_ahead)[0]
+        speed_candidates = np.where(check_distance >= 0.0)[0]
 
-        self.steer_pub.publish(Float32(data=float(steering)))
-        self.throttle_pub.publish(Float32(data=float(self.constant_throttle)))
+        if len(nearest) > 0:
+            self.count = start + int(nearest[0])
+        else:
+            self.count += 1
 
-    def stop_robot(self):
-        self.steer_pub.publish(Float32(data=0.0))
-        self.throttle_pub.publish(Float32(data=0.0))
+        if len(speed_candidates) > 0:
+            self.speed_count = start + int(speed_candidates[0])
+        else:
+            self.speed_count = self.count
+
+        if self.count >= self.path_len:
+            self.count = 10
+            self.speed_count = 10
+
+        self.speed_count = min(self.speed_count, self.path_len - 1)
+
+    # ------------------------------------------------------------------
+    # Plotting
+    # ------------------------------------------------------------------
+
+    def _update_plots(self):
+        self.car_plot.set_data([self.position[0]], [self.position[1]])
+        self.target_plot.set_data([self.goal[self.count, 0]], [self.goal[self.count, 1]])
+        self.ips_trail_plot.set_data(self.ips_trail_x, self.ips_trail_y)
+        self.ips_plot.set_data([self.odom_position[0]], [self.odom_position[1]])
+        self.trail_plot.set_data(self.car_trail_x, self.car_trail_y)
+        self.fig.canvas.draw_idle()
+        self.fig.canvas.flush_events()
+
+        self.target_speed_plot.set_data(self.time_log, self.target_speed_log)
+        self.actual_speed_plot.set_data(self.time_log, self.actual_speed_log)
+        self.odom_velx_plot.set_data(self.time_log, self.odom_velx_log)
+        self.ax2.relim()
+        self.ax2.autoscale_view()
+        self.fig2.canvas.draw_idle()
+        self.fig2.canvas.flush_events()
+
+    # ------------------------------------------------------------------
+    # Main loop
+    # ------------------------------------------------------------------
+
+    def timer_callback(self):
+        # Log trail
+        self.ips_trail_x.append(self.position[0])
+        self.ips_trail_y.append(self.position[1])
+        self.car_trail_x.append(self.odom_position[0])
+        self.car_trail_y.append(self.odom_position[1])
+
+        self.get_logger().info('Publishing : >_<')
+
+        # Find lookahead point
+        self._update_lookahead_index()
+
+        # Steering
+        xy_cf = self._to_car_frame(self.position, self.goal[self.count], self.car_yaw)
+        curvature = self._curvature(xy_cf)
+        steer = self._steering_angle(curvature) / self.MAX_STEER
+
+        # Target velocity from profile
+        target_velocity = 2.3 + self.vel_profile[self.speed_count] / 2
+
+        # Dynamic lookahead
+        self.look_ahead = 2.5 if target_velocity > 5.0 else 1.8
+
+        # Feedforward throttle
+        throttle_cmd = self._feedforward_throttle(target_velocity)
+
+        # Publish
+        st_msg = Float32()
+        st_msg.data = float(steer)
+        thr_msg = Float32()
+        thr_msg.data = float(throttle_cmd)
+        self.steer_pub.publish(st_msg)
+        self.throttle_pub.publish(thr_msg)
+
+        # Speed logging
+        self.sim_time += self.DT
+        self.time_log.append(self.sim_time)
+        self.target_speed_log.append(float(target_velocity))
+        self.actual_speed_log.append(float(self.odom_speed))
+        self.odom_velx_log.append(float(self.odom_vel_x))
+
+        if len(self.time_log) > self.MAX_SPEED_POINTS:
+            del self.time_log[0]
+            del self.target_speed_log[0]
+            del self.actual_speed_log[0]
+            del self.odom_velx_log[0]
+
+        # Plotting (10 Hz)
+        self.plot_counter += 1
+        if self.plot_counter % self.PLOT_EVERY_N == 0:
+            self._update_plots()
+
+        # Debug
+        self.get_logger().info(f'yaw angle: {round(self.car_yaw, 3)}')
+        self.get_logger().info(f'steering command: {round(steer, 3)} >_<')
+        self.get_logger().info(f'throttle command: {throttle_cmd} >_<')
+        self.get_logger().info(f'Lookahead: {self.look_ahead} >_<')
+        self.get_logger().info(f'index: {self.count} >_<')
+
+    # ------------------------------------------------------------------
+    # Shutdown
+    # ------------------------------------------------------------------
+
+    def save_path(self, filename='/home/autodrive_devkit/actual_path.csv'):
+        np.savetxt(
+            filename,
+            np.column_stack((self.car_trail_x, self.car_trail_y)),
+            delimiter=',',
+            header='x,y',
+            comments='',
+        )
 
 
 def main(args=None):
@@ -160,8 +350,10 @@ def main(args=None):
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        node.stop_robot()
+        pass
     finally:
+        plt.close('all')
+        node.save_path()
         node.destroy_node()
         rclpy.shutdown()
 
