@@ -6,11 +6,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import rclpy
-from geometry_msgs.msg import Point
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from scipy.spatial.transform import Rotation as R
-from sensor_msgs.msg import Imu
 from std_msgs.msg import Float32
 
 
@@ -23,7 +21,7 @@ class PurePursuitNode(Node):
     """
 
     # Path to CSV with columns [positions_X, positions_y, Velocity]
-    CSV_PATH = '/home/autodrive_devkit/src/f1tenth_control/practice_iros_2026.csv'
+    CSV_PATH = '/home/autodrive_devkit/src/f1tenth_control/previous_compete_test.csv'
 
     # Feedforward throttle gain
     # If throttle command is 0-100 scale, change to 4.131
@@ -81,7 +79,7 @@ class PurePursuitNode(Node):
         # ----- Main loop timer -----
         self.timer = self.create_timer(self.DT, self.timer_callback)
 
-        self.get_logger().info('Pure Pursuit node started.')
+        self.get_logger().info('Pure Pursuit node started (ODOM ONLY).')
 
     # ------------------------------------------------------------------
     # Setup
@@ -106,24 +104,14 @@ class PurePursuitNode(Node):
         return int(np.argmin(distances))
 
     def _setup_ros_interfaces(self):
+        # Only Odom is used for localization now
         self.create_subscription(
             Odometry,
             '/autodrive/roboracer_1/odom',
             self.odom_callback,
             10,
         )
-        self.create_subscription(
-            Point,
-            '/autodrive/roboracer_1/ips',
-            self.ips_callback,
-            10,
-        )
-        self.create_subscription(
-            Imu,
-            '/autodrive/roboracer_1/imu',
-            self.yaw_callback,
-            10,
-        )
+        
         self.steer_pub = self.create_publisher(
             Float32,
             '/autodrive/roboracer_1/steering_command',
@@ -173,18 +161,26 @@ class PurePursuitNode(Node):
     # ------------------------------------------------------------------
 
     def odom_callback(self, msg: Odometry):
-        self.odom_position[0] = msg.pose.pose.position.x
-        self.odom_position[1] = msg.pose.pose.position.y
+        # Update both position variables to maintain plotting logic
+        x = msg.pose.pose.position.x
+        y = msg.pose.pose.position.y
+        self.position[0] = x
+        self.position[1] = y
+        self.odom_position[0] = x
+        self.odom_position[1] = y
+
+        # Velocity
         self.odom_vel_x = msg.twist.twist.linear.x
         self.odom_vel_y = msg.twist.twist.linear.y
         self.odom_speed = math.sqrt(self.odom_vel_x ** 2 + self.odom_vel_y ** 2)
 
-    def ips_callback(self, msg: Point):
-        self.position[0] = msg.x
-        self.position[1] = msg.y
-
-    def yaw_callback(self, msg: Imu):
-        q = [msg.orientation.x, msg.orientation.y, msg.orientation.z, msg.orientation.w]
+        # Yaw from Quaternion
+        q = [
+            msg.pose.pose.orientation.x,
+            msg.pose.pose.orientation.y,
+            msg.pose.pose.orientation.z,
+            msg.pose.pose.orientation.w
+        ]
         _, _, self.car_yaw = R.from_quat(q).as_euler('xyz')
 
     # ------------------------------------------------------------------
@@ -289,10 +285,10 @@ class PurePursuitNode(Node):
         steer = self._steering_angle(curvature) / self.MAX_STEER
 
         # Target velocity from profile
-        target_velocity = 2.3 + self.vel_profile[self.speed_count] / 2
+        target_velocity = 2.3 + self.vel_profile[self.speed_count] / 2.3
 
         # Dynamic lookahead
-        self.look_ahead = 2.5 if target_velocity > 5.0 else 1.8
+        self.look_ahead = 2.5 if target_velocity > 5.0 else 1.5
 
         # Feedforward throttle
         throttle_cmd = self._feedforward_throttle(target_velocity)
