@@ -30,6 +30,7 @@ docker exec -it autodrive_roboracer_api bash
 
 ros2 launch compete_bringup final_odom.launch.xml 
 
+ros2 run f1tenth_control pure_pursuit_node
 
 docker run -it \
   --name autodrive_roboracer_api \
