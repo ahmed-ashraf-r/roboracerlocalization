@@ -21,7 +21,7 @@ class PurePursuitNode(Node):
     """
 
     # Path to CSV with columns [positions_X, positions_y, Velocity]
-    CSV_PATH = '/home/autodrive_devkit/src/f1tenth_control/previous_compete_test.csv'
+    CSV_PATH = '/home/autodrive_devkit/src/f1tenth_control/appp.csv'
 
     # Feedforward throttle gain
     # If throttle command is 0-100 scale, change to 4.131
@@ -33,7 +33,7 @@ class PurePursuitNode(Node):
     # Pure Pursuit parameters
     WHEELBASE = 0.3240
     MAX_STEER = 0.5236
-
+    
     # Plot buffers
     MAX_SPEED_POINTS = 750
     PLOT_EVERY_N = 10
@@ -79,7 +79,7 @@ class PurePursuitNode(Node):
         # ----- Main loop timer -----
         self.timer = self.create_timer(self.DT, self.timer_callback)
 
-        self.get_logger().info('Pure Pursuit node started (ODOM ONLY).')
+        self.get_logger().info('Pure Pursuit node started (ODOM ONLY + LATERAL ACCEL LIMIT).')
 
     # ------------------------------------------------------------------
     # Setup
@@ -107,7 +107,7 @@ class PurePursuitNode(Node):
         # Only Odom is used for localization now
         self.create_subscription(
             Odometry,
-            '/autodrive/roboracer_1/odom',
+            '/pf/pose/odom',
             self.odom_callback,
             10,
         )
@@ -285,7 +285,7 @@ class PurePursuitNode(Node):
         steer = self._steering_angle(curvature) / self.MAX_STEER
 
         # Target velocity from profile
-        target_velocity = 2.3 + self.vel_profile[self.speed_count] / 2.3
+        target_velocity = 2.3 + self.vel_profile[self.speed_count] / 2.8
 
         # Dynamic lookahead
         self.look_ahead = 2.5 if target_velocity > 5.0 else 1.5

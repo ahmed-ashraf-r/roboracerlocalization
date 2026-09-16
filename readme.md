@@ -8,7 +8,6 @@ Create the Docker folder and copy `range_libc` into it:
 
 ```bash
 mkdir autodrive_roboracer_docker
-then copy "range_libc" to this forder 
 cd autodrive_roboracer_docker
 touch Dockerfile
 ```
