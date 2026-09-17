@@ -12,7 +12,7 @@
             name="ackermann_odom"
             output="screen">
         </node>
-    </timer>11
+    </timer>
 
     <!-- 3. RF2O Laser Odometry (t = 2s) -->
     <timer period="2.0">

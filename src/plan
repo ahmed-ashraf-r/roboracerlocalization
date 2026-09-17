@@ -1,8 +1,0 @@
-1- edit pure pursiut node to variable look ahead distance 
-2- edit target velocity
-3- test odom topic 
-
-"
-tune look ahead l_max . l_min , kv
-find equation for target velocity
-test odom topic 
