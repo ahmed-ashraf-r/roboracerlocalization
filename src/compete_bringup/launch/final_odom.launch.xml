@@ -15,13 +15,15 @@
     </timer>
 
     <!-- 3. RF2O Laser Odometry (t = 2s) -->
+    <!--
     <timer period="2.0">
         <include file="$(find-pkg-share rf2o_laser_odometry)/launch/compete_laser_odom.launch.py">
         </include>
     </timer>
+-->
 
     <!-- 4. Localization (EKF) (t = 3s) -->
-    <timer period="3.0">
+    <timer period="2.0">
         <include file="$(find-pkg-share compete_localiztion)/launch/local_localization.launch.xml">
         </include>
     </timer>
@@ -36,13 +38,13 @@
     </node>
 
     <!-- 6. Particle Filter (t = 4s) -->
-    <timer period="4.0">
+    <timer period="3.0">
         <include file="$(find-pkg-share particle_filter)/launch/localize_launch.py">
         </include>
     </timer>
 
     <!-- 7. Auto-Publish Initial Pose (t = 5s) -->
-    <timer period="5.0">
+    <timer period="4.0">
         <executable
             cmd="ros2 topic pub --once /initialpose geometry_msgs/msg/PoseWithCovarianceStamped '{header: {frame_id: map}, pose: {pose: {position: {x: 0.7994, y: 3.1583, z: 0.0}, orientation: {x: 0.0, y: 0.0, z: -0.7071, w: 0.7071}}, covariance: [0.25, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.25, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0685]}}'"
             output="screen" />

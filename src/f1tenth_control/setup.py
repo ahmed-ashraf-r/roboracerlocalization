@@ -24,7 +24,7 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'pure_pursuit_node = f1tenth_control.pure_pursuit_node:main',
+            'pps_icra_2026= f1tenth_control.pps_icra_2026:main'
         ],
     },
 )
