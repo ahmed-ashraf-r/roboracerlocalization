@@ -21,7 +21,7 @@ class PurePursuitNode(Node):
     """
 
     # Path to CSV with columns [positions_X, positions_y, Velocity]
-    CSV_PATH = '/home/autodrive_devkit/src/f1tenth_control/appp.csv'
+    CSV_PATH = '/home/autodrive_devkit/src/f1tenth_control/practice_iros_2026.csv'
 
     # Feedforward throttle gain
     # If throttle command is 0-100 scale, change to 4.131
