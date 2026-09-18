@@ -19,7 +19,7 @@ from std_msgs.msg import Float32
 #
 # CONTROL SOURCES:
 #   Position : /pf/pose/odom
-#   Speed    : /pf/pose/odom
+#   Speed    : /odometry/filtered (EKF)
 #   Yaw      : /autodrive/roboracer_1/imu
 #
 #   IPS       : plotting / comparison only
@@ -50,10 +50,16 @@ odom_current_speed = 0.0
 car_yaw = 0.0
 
 # Particle Filter Odom
-# Used for actual vehicle control
+# Position is used for actual vehicle control.
+# Speed is kept only for plotting / comparison.
 pf_odom_position = np.array([x_postition, y_postition])
 pf_odom_speed = 0.0
 pf_odom_received = False
+
+# EKF odometry
+# Speed source used for actual vehicle control.
+ekf_speed = 0.0
+ekf_speed_received = False
 
 
 # -------------------------------------------------------------------------
@@ -163,7 +169,6 @@ index = np.argmin(distances)
 count = index
 
 speed_count = 0
-target_speed_idx = 0
 
 search_len = path_len / 5
 
@@ -174,10 +179,29 @@ search_end = min(
 
 
 # -------------------------------------------------------------------------
+# Dynamic CSV speed-profile preview
+# -------------------------------------------------------------------------
+#
+# This RoboRacer is a small-scale vehicle and the approved path has
+# approximately 0.10 m waypoint spacing.  The preview is intentionally
+# modest: at the maximum target speed (~5.8 m/s after the /1.7 scaling)
+# it is about 1.43 m (~14 waypoints), not several metres.
+#
+# The gain has units of seconds: distance ~= speed * preview_time.
+# It compensates for the measured transient lag without using PID or
+# abruptly cutting throttle.
+#
+SPEED_PREVIEW_BASE = 0.15       # [m]
+SPEED_PREVIEW_TIME = 0.22       # [s]
+SPEED_PREVIEW_MIN = 0.35        # [m]
+SPEED_PREVIEW_MAX = 1.45        # [m]
+
+
+# -------------------------------------------------------------------------
 # Throttle
 # -------------------------------------------------------------------------
 
-K_FF = 0.0418
+K_FF = 0.04131
 
 
 # -------------------------------------------------------------------------
@@ -336,7 +360,7 @@ actual_speed_plot, = ax2.plot(
     [],
     'b-',
     linewidth=1.5,
-    label='PF Control Speed'
+    label='EKF Control Speed'
 )
 
 odom_velx_plot, = ax2.plot(
@@ -356,7 +380,7 @@ pf_speed_plot, = ax2.plot(
 )
 
 ax2.set_title(
-    "Speed Tracking: Target vs PF Odom"
+    "Speed Tracking: Target vs EKF Speed"
 )
 
 ax2.set_xlabel("Time [s]")
@@ -415,8 +439,8 @@ def odom_callback(odom_msg):
 # Particle Filter Odometry callback
 #
 # Used for:
-#   Position
-#   Speed
+#   Position -> CONTROL
+#   Speed    -> plotting / comparison only
 #
 # NOT used for yaw
 # -------------------------------------------------------------------------
@@ -440,7 +464,8 @@ def pf_odom_callback(msg):
     )
 
     # -------------------------------------------------
-    # Speed used for throttle and dynamic lookahead
+    # PF speed kept only for plotting / comparison.
+    # EKF speed is the control-speed source.
     # -------------------------------------------------
 
     vx = msg.twist.twist.linear.x
@@ -453,6 +478,31 @@ def pf_odom_callback(msg):
     )
 
     pf_odom_received = True
+
+
+# -------------------------------------------------------------------------
+# EKF odometry callback
+#
+# Used for:
+#   Speed -> CONTROL
+#
+# Position from this topic is NOT used for global path tracking.
+# -------------------------------------------------------------------------
+
+def ekf_odom_callback(msg):
+
+    global ekf_speed
+    global ekf_speed_received
+
+    vx = float(msg.twist.twist.linear.x)
+    vy = float(msg.twist.twist.linear.y)
+
+    # Speed magnitude from the smooth 50 Hz EKF estimate.
+    # The vehicle races forward, but hypot() also makes this robust
+    # to a small lateral component in the EKF output.
+    ekf_speed = math.hypot(vx, vy)
+
+    ekf_speed_received = True
 
 
 # -------------------------------------------------------------------------
@@ -691,10 +741,11 @@ def steering_func(
 
 
 def speed_control(
-    target_speed,
-    actual_speed
+    target_speed
 ):
 
+    # Feedforward-only throttle law identified from the simulator's
+    # steady-state throttle-to-speed regression.
     output = (
         K_FF *
         target_speed
@@ -706,6 +757,49 @@ def speed_control(
     )
 
     return throttle
+
+
+def advance_path_index_by_distance(
+    start_idx,
+    path_xy,
+    distance_m
+):
+    """
+    Move forward along the CSV path by arc length.
+
+    This uses path distance, not Euclidean distance.  That is important
+    near bends, because a point that is geometrically close can be much
+    farther ahead along the racing line.
+    """
+
+    n = len(path_xy)
+
+    if n == 0:
+        return 0
+
+    idx = int(start_idx) % n
+    travelled = 0.0
+
+    # Protect against a malformed path containing many zero-length
+    # segments by limiting traversal to one complete lap.
+    for _ in range(n):
+
+        if travelled >= distance_m:
+            break
+
+        next_idx = (idx + 1) % n
+
+        segment_length = float(
+            np.linalg.norm(
+                path_xy[next_idx] -
+                path_xy[idx]
+            )
+        )
+
+        travelled += segment_length
+        idx = next_idx
+
+    return idx
 
 
 # ==========================================================================
@@ -722,6 +816,8 @@ def timer_func(
     global pf_odom_position
     global car_yaw
     global pf_odom_received
+    global ekf_speed
+    global ekf_speed_received
     global count
     global plot_counter
     global look_ahead
@@ -746,7 +842,6 @@ def timer_func(
     global pf_speed_log
 
     global speed_count
-    global target_speed_idx
 
 
     # ----------------------------------------------------------------------
@@ -759,13 +854,13 @@ def timer_func(
 
 
     # ----------------------------------------------------------------------
-    # Wait for PF odometry
+    # Wait for the two control-state sources
     # ----------------------------------------------------------------------
 
-    if not pf_odom_received:
+    if not pf_odom_received or not ekf_speed_received:
 
         node.get_logger().warn(
-            'Waiting for /pf/pose/odom before '
+            'Waiting for PF position and EKF speed before '
             'publishing control commands...'
         )
 
@@ -775,9 +870,11 @@ def timer_func(
     # ----------------------------------------------------------------------
     # CONTROL SOURCES
     #
-    # Position -> Particle Filter
-    # Yaw      -> IMU
-    # Speed    -> Particle Filter
+    # Position -> Particle Filter       /pf/pose/odom
+    # Yaw      -> IMU                   /autodrive/roboracer_1/imu
+    # Speed    -> EKF                   /odometry/filtered
+    #
+    # PF speed remains available only for plotting / comparison.
     # ----------------------------------------------------------------------
 
     control_position = (
@@ -789,7 +886,7 @@ def timer_func(
     )
 
     control_speed = (
-        pf_odom_speed
+        ekf_speed
     )
 
 
@@ -878,42 +975,13 @@ def timer_func(
         ) % path_len
 
 
-    # ----------------------------------------------------------------------
-    # Speed profile waypoint
-    # ----------------------------------------------------------------------
-
-    target_speed_idx = np.where(
-        check_distance >= 0.3
-    )[0]
-
-
-    if len(target_speed_idx) > 0:
-
-        speed_count = (
-            start +
-            int(target_speed_idx[0])
-        )
-
-    else:
-
-        speed_count = count
-
-
     if count >= path_len:
 
         count = 10
 
-        speed_count = 10
-
-
-    speed_count = min(
-        speed_count,
-        path_len - 1
-    )
-
 
     # ----------------------------------------------------------------------
-    # Find nearest waypoint for offset lookahead
+    # Find nearest waypoint for offset lookahead and speed preview
     # ----------------------------------------------------------------------
 
     pw_idx = int(
@@ -926,6 +994,36 @@ def timer_func(
                  control_position[1]) ** 2
             )
         )
+    )
+
+
+    # ----------------------------------------------------------------------
+    # Dynamic feedforward speed-profile preview
+    #
+    # Small-scale-car tuning:
+    #   1.0 m/s -> 0.37 m
+    #   3.0 m/s -> 0.81 m
+    #   5.0 m/s -> 1.25 m
+    #   5.8 m/s -> 1.43 m
+    #
+    # Only the point sampled from the CSV moves forward.  Throttle remains
+    # the same feedforward law: throttle = 0.04131 * target_velocity.
+    # There is no PID and no throttle cut.
+    # ----------------------------------------------------------------------
+
+    speed_preview_distance = float(
+        np.clip(
+            SPEED_PREVIEW_BASE +
+            SPEED_PREVIEW_TIME * control_speed,
+            SPEED_PREVIEW_MIN,
+            SPEED_PREVIEW_MAX
+        )
+    )
+
+    speed_count = advance_path_index_by_distance(
+        pw_idx,
+        goal,
+        speed_preview_distance
     )
 
 
@@ -975,7 +1073,8 @@ def timer_func(
     # ======================================================================
     # 2. THROTTLE
     #
-    # Speed = PF
+    # Throttle = feedforward from CSV target speed
+    # EKF speed is NOT fed back into throttle
     # ======================================================================
 
     target_velocity = (
@@ -991,8 +1090,7 @@ def timer_func(
 
 
     throttle_cmd = speed_control(
-        target_velocity,
-        control_speed
+        target_velocity
     )
 
     thr.data = float(
@@ -1171,6 +1269,12 @@ def timer_func(
     )
 
     node.get_logger().info(
+        f"Speed preview : "
+        f"{round(speed_preview_distance, 3)} m, "
+        f"speed index : {speed_count} >_<"
+    )
+
+    node.get_logger().info(
         f"index : "
         f"{count} >_<"
     )
@@ -1235,13 +1339,28 @@ def main(args=None):
     # ----------------------------------------------------------------------
     # Particle Filter Odometry
     #
-    # Position + speed for control
+    # Position -> control
+    # Speed    -> plotting / comparison only
     # ----------------------------------------------------------------------
 
     pf_odom_sub = my_node.create_subscription(
         Odometry,
         '/pf/pose/odom',
         pf_odom_callback,
+        10
+    )
+
+
+    # ----------------------------------------------------------------------
+    # EKF Odometry
+    #
+    # Speed -> control
+    # ----------------------------------------------------------------------
+
+    ekf_odom_sub = my_node.create_subscription(
+        Odometry,
+        '/odometry/filtered',
+        ekf_odom_callback,
         10
     )
 
