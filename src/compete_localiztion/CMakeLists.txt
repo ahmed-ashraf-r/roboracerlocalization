@@ -24,6 +24,7 @@ install(
 
 install( PROGRAMS
   ${PROJECT_NAME}/ackermann_odom.py
+  ${PROJECT_NAME}/global_odom_fuser.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

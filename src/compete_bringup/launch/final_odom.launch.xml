@@ -1,10 +1,21 @@
 <launch>
 
-    <!-- 1. Robot / Graphics Bringup (t = 0s) -->
+    <!-- 1. Simulator / Graphics -->
     <include file="$(find-pkg-share autodrive_roboracer)/launch/bringup_graphics.launch.py">
     </include>
 
-    <!-- 2. Ackermann Odometry (t = 1s) -->
+
+    <!-- 2. map -> world static bridge -->
+    <node
+        pkg="tf2_ros"
+        exec="static_transform_publisher"
+        name="map_world_tf"
+        args="0 0 0 0 0 0 map world"
+        output="screen">
+    </node>
+
+
+    <!-- 3. Ackermann odometry -->
     <timer period="1.0">
         <node
             pkg="compete_localiztion"
@@ -14,40 +25,31 @@
         </node>
     </timer>
 
-    <!-- 3. RF2O Laser Odometry (t = 2s) -->
-    <!--
-    <timer period="2.0">
-        <include file="$(find-pkg-share rf2o_laser_odometry)/launch/compete_laser_odom.launch.py">
-        </include>
-    </timer>
--->
 
-    <!-- 4. Localization (EKF) (t = 3s) -->
+    <!-- 4. EKF -->
     <timer period="2.0">
-        <include file="$(find-pkg-share compete_localiztion)/launch/local_localization.launch.xml">
+        <include
+            file="$(find-pkg-share compete_localiztion)/launch/local_localization.launch.xml">
         </include>
     </timer>
 
-    <!-- 5. Static TF Bridge (t = 0s — no deps) -->
-    <node
-        pkg="tf2_ros"
-        exec="static_transform_publisher"
-        name="map_world_tf"
-        args="0 0 0 0 0 0 map world"
-        output="screen">
-    </node>
 
-    <!-- 6. Particle Filter (t = 4s) -->
+    <!-- 5. Particle Filter -->
     <timer period="3.0">
-        <include file="$(find-pkg-share particle_filter)/launch/localize_launch.py">
+        <include
+            file="$(find-pkg-share particle_filter)/launch/localize_launch.py">
         </include>
     </timer>
 
-    <!-- 7. Auto-Publish Initial Pose (t = 5s) -->
-    <timer period="4.0">
-        <executable
-            cmd="ros2 topic pub --once /initialpose geometry_msgs/msg/PoseWithCovarianceStamped '{header: {frame_id: map}, pose: {pose: {position: {x: 0.7994, y: 3.1583, z: 0.0}, orientation: {x: 0.0, y: 0.0, z: -0.7071, w: 0.7071}}, covariance: [0.0025 , 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0025 , 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.001218]}}'"
-            output="screen" />
+
+    <!-- 6. Global high-rate odometry -->
+    <timer period="4.5">
+        <node
+            pkg="compete_localiztion"
+            exec="global_odom_fuser.py"
+            name="global_odom_fuser"
+            output="screen">
+        </node>
     </timer>
 
 </launch>

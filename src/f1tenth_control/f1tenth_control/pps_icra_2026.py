@@ -14,77 +14,151 @@ from std_msgs.msg import Float32
 
 
 # ==========================================================================
-# Regulated Pure Pursuit + Feedforward Throttle
-# ICRA 2026 Competition Round
+# RoboRacer ICRA 2026 - High-Rate Global Localization Pure Pursuit
 #
-# CONTROL SOURCES:
-#   Position : /pf/pose/odom
-#   Speed    : /odometry/filtered (EKF)
+# CONTROL STATE
+#   Position : /localization/odom
+#              PF-corrected global pose propagated by EKF at ~50 Hz
+#
+#   Speed    : /localization/odom.twist
+#              This is the EKF twist copied by global_odom_fuser, therefore
+#              it is synchronized with the global pose and arrives at ~50 Hz.
+#
 #   Yaw      : /autodrive/roboracer_1/imu
 #
-#   IPS       : plotting / comparison only
-#   Simulator Odom : plotting / comparison only
+# DIAGNOSTIC ONLY
+#   /pf/pose/odom
+#   /autodrive/roboracer_1/odom
+#   /autodrive/roboracer_1/ips
+#
+# LONGITUDINAL CONTROL
+#   Feedforward only:
+#       throttle = 0.04131 * target_velocity
+#
+#   NO PID.
+#   NO overspeed throttle cut.
 # ==========================================================================
 
 
-# -------------------------------------------------------------------------
-# Global variables
-# -------------------------------------------------------------------------
+# ==========================================================================
+# MAIN RACING TUNING
+# ==========================================================================
 
-# Initial car position
-x_postition = 0.8
-y_postition = 3.16
+# /localization/odom and EKF are both ~50 Hz, so run control at 50 Hz.
+CONTROL_PERIOD = 0.020          # [s] = 50 Hz
 
-# IPS-based position
-# Used ONLY for comparison / plotting
-postition = np.array([x_postition, y_postition])
+# Proven baseline after Global Odom Fuser V2.
+# Keep 1.50 for the first latency-compensation validation.
+# After several clean laps, the next planned test is 1.30.
+VELOCITY_DIVISOR = 1.50
 
-# Simulator wheel odometry
-# Used ONLY for comparison / plotting
-odom_postition = np.array([x_postition, y_postition])
-odom_current_vel_x = 0.0
-odom_current_vel_y = 0.0
-odom_current_speed = 0.0
+# Measured simulator feedforward relation.
+K_FF = 0.04131
 
-# IMU yaw
+# Vehicle geometry.
+WHEELBASE = 0.3240
+MAX_STEERING_RAD = 0.5236
+
+# Steering lookahead.
+STEER_LOOKAHEAD_GAIN = 0.45
+STEER_LOOKAHEAD_MIN = 0.70
+STEER_LOOKAHEAD_MAX = 2.00
+
+# Measured steering actuator delay from rosbag analysis was about 0.12 s.
+# Start with 0.10 s compensation so we anticipate the actuator without
+# over-predicting the vehicle motion.
+STEERING_LATENCY_COMP = 0.10   # [s]
+
+# Dynamic speed preview.
+# ~1.43 m at 5.8 m/s and ~1.98 m at 8.3 m/s.
+SPEED_PREVIEW_BASE = 0.15       # [m]
+SPEED_PREVIEW_TIME = 0.22       # [s]
+SPEED_PREVIEW_MIN = 0.35        # [m]
+SPEED_PREVIEW_MAX = 2.05        # [m]
+
+# Offset-lookahead tuning.
+ALPHA_MAX = 0.05
+BETA_MAX = 0.90
+MAX_OFFSET_DIST = 0.45
+
+# Local path association window.
+NEAREST_SEARCH_BEHIND = 12
+NEAREST_SEARCH_AHEAD = 90
+
+# Development diagnostics.
+# Disable plotting for official timed runs.
+ENABLE_PLOTTING = False
+PLOT_EVERY_N = 25              # 2 Hz
+LOG_EVERY_N = 10               # 5 Hz
+
+
+# ==========================================================================
+# GLOBAL STATE
+# ==========================================================================
+
+x_position = 0.8
+y_position = 3.16
+
+# CONTROL state from /localization/odom.
+localization_position = np.array(
+    [x_position, y_position],
+    dtype=float
+)
+localization_speed = 0.0
+localization_received = False
+
+# IMU yaw and yaw rate.
 car_yaw = 0.0
+car_yaw_rate = 0.0
+imu_received = False
 
-# Particle Filter Odom
-# Position is used for actual vehicle control.
-# Speed is kept only for plotting / comparison.
-pf_odom_position = np.array([x_postition, y_postition])
+# Diagnostics only.
+pf_odom_position = np.array(
+    [x_position, y_position],
+    dtype=float
+)
 pf_odom_speed = 0.0
-pf_odom_received = False
 
-# EKF odometry
-# Speed source used for actual vehicle control.
-ekf_speed = 0.0
-ekf_speed_received = False
+sim_odom_position = np.array(
+    [x_position, y_position],
+    dtype=float
+)
+sim_odom_speed = 0.0
+
+ips_position = np.array(
+    [x_position, y_position],
+    dtype=float
+)
 
 
-# -------------------------------------------------------------------------
-# Centerline path of ICRA 2026 Competition
-# CSV has NO header -> assign column names manually
-# -------------------------------------------------------------------------
+# ==========================================================================
+# LOAD TRACK
+# ==========================================================================
 
 path_data = pd.read_csv(
     '/home/autodrive_devkit/src/f1tenth_control/approved_2.csv',
     header=None,
-    names=['positions_X', 'positions_y', 'Velocity']
+    names=[
+        'positions_X',
+        'positions_y',
+        'Velocity'
+    ]
 )
 
-goal_list = list(zip(
-    path_data['positions_X'],
-    path_data['positions_y']
-))
+goal = path_data[
+    ['positions_X', 'positions_y']
+].to_numpy(dtype=float)
 
-goal = np.array(goal_list)
+vel_profile = path_data[
+    'Velocity'
+].to_numpy(dtype=float)
+
 path_len = len(goal)
 
 
-# -------------------------------------------------------------------------
-# Path curvature
-# -------------------------------------------------------------------------
+# ==========================================================================
+# PATH PRECOMPUTATION
+# ==========================================================================
 
 def compute_path_curvature(path_xy):
 
@@ -97,33 +171,32 @@ def compute_path_curvature(path_xy):
         p_curr = path_xy[i]
         p_next = path_xy[(i + 1) % n]
 
-        a = np.hypot(
-            p_curr[0] - p_prev[0],
-            p_curr[1] - p_prev[1]
+        a = np.linalg.norm(
+            p_curr - p_prev
         )
 
-        b = np.hypot(
-            p_next[0] - p_curr[0],
-            p_next[1] - p_curr[1]
+        b = np.linalg.norm(
+            p_next - p_curr
         )
 
-        c = np.hypot(
-            p_next[0] - p_prev[0],
-            p_next[1] - p_prev[1]
+        c = np.linalg.norm(
+            p_next - p_prev
         )
 
-        area = 0.5 * abs(
+        cross_z = (
             (p_curr[0] - p_prev[0]) *
             (p_next[1] - p_prev[1])
             -
-            (p_next[0] - p_prev[0]) *
-            (p_curr[1] - p_prev[1])
+            (p_curr[1] - p_prev[1]) *
+            (p_next[0] - p_prev[0])
         )
+
+        area = 0.5 * abs(cross_z)
 
         denom = a * b * c
 
         curvature[i] = (
-            4 * area / denom
+            4.0 * area / denom
             if denom > 1e-9
             else 0.0
         )
@@ -131,494 +204,621 @@ def compute_path_curvature(path_xy):
     return curvature
 
 
-path_curvature = compute_path_curvature(goal)
-
-vel_profile = path_data['Velocity'].to_numpy()
-
-
-# -------------------------------------------------------------------------
-# Pure Pursuit parameters
-# -------------------------------------------------------------------------
-
-velocity = 0.13
-
-look_ahead = 2.0
-
-wheelbase = 0.3240
-
-
-# -------------------------------------------------------------------------
-# Offset look-ahead parameters
-# -------------------------------------------------------------------------
-
-ALPHA_MAX = 0.05
-BETA_MAX = 0.9
-
-
-# -------------------------------------------------------------------------
-# Initial waypoint
-# -------------------------------------------------------------------------
-
-distances = np.sqrt(
-    (goal[:, 0] - x_postition) ** 2 +
-    (goal[:, 1] - y_postition) ** 2
-)
-
-index = np.argmin(distances)
-
-count = index
-
-speed_count = 0
-
-search_len = path_len / 5
-
-search_end = min(
-    count + int(search_len),
-    path_len
+path_curvature = compute_path_curvature(
+    goal
 )
 
 
-# -------------------------------------------------------------------------
-# Dynamic CSV speed-profile preview
-# -------------------------------------------------------------------------
-#
-# This RoboRacer is a small-scale vehicle and the approved path has
-# approximately 0.10 m waypoint spacing.  The preview is intentionally
-# modest: at the maximum target speed (~5.8 m/s after the /1.7 scaling)
-# it is about 1.43 m (~14 waypoints), not several metres.
-#
-# The gain has units of seconds: distance ~= speed * preview_time.
-# It compensates for the measured transient lag without using PID or
-# abruptly cutting throttle.
-#
-SPEED_PREVIEW_BASE = 0.15       # [m]
-SPEED_PREVIEW_TIME = 0.22       # [s]
-SPEED_PREVIEW_MIN = 0.35        # [m]
-SPEED_PREVIEW_MAX = 1.45        # [m]
+initial_distances = np.linalg.norm(
+    goal -
+    np.array(
+        [x_position, y_position]
+    ),
+    axis=1
+)
+
+nearest_path_idx = int(
+    np.argmin(initial_distances)
+)
+
+lookahead_idx = nearest_path_idx
+speed_idx = nearest_path_idx
 
 
-# -------------------------------------------------------------------------
-# Throttle
-# -------------------------------------------------------------------------
+# ==========================================================================
+# LOGGING / PLOTTING
+# ==========================================================================
 
-K_FF = 0.04131
-
-
-# -------------------------------------------------------------------------
-# Plotting setup
-# -------------------------------------------------------------------------
-
-plot_counter = 0
-
-car_trail_x = []
-car_trail_y = []
-
-# IPS trail
-ips_trail_x = []
-ips_trail_y = []
-
-# PF trail
-pf_trail_x = []
-pf_trail_y = []
-
-
-# -------------------------------------------------------------------------
-# Speed plotting
-# -------------------------------------------------------------------------
-
-time_log = []
-
-target_speed_log = []
-
-actual_speed_log = []
-
-odom_velx_log = []
-
-pf_speed_log = []
-
+control_counter = 0
 sim_time = 0.0
 
 MAX_SPEED_POINTS = 750
 
+time_log = []
+target_speed_log = []
+control_speed_log = []
+sim_speed_log = []
+pf_speed_log = []
 
-# -------------------------------------------------------------------------
-# Figure 1
-# -------------------------------------------------------------------------
+localization_trail_x = []
+localization_trail_y = []
 
-plt.ion()
+pf_trail_x = []
+pf_trail_y = []
 
-fig, ax = plt.subplots(figsize=(8, 8))
+sim_trail_x = []
+sim_trail_y = []
 
-ax.plot(
-    goal[:, 0],
-    goal[:, 1],
-    'k--',
-    label='CSV Path'
-)
-
-car_plot, = ax.plot(
-    [],
-    [],
-    'ro',
-    markersize=8,
-    label='PF Control Pose'
-)
-
-target_plot, = ax.plot(
-    [],
-    [],
-    'go',
-    markersize=8,
-    label='Lookahead Point'
-)
-
-trail_plot, = ax.plot(
-    [],
-    [],
-    'b-',
-    linewidth=1.5,
-    label='Wheel Odom Path'
-)
-
-offset_lk, = ax.plot(
-    [],
-    [],
-    'yo',
-    markersize=8,
-    label='Offset Lookahead'
-)
-
-ips_plot, = ax.plot(
-    [],
-    [],
-    'm^',
-    markersize=8,
-    label='IPS Pose'
-)
-
-ips_trail_plot, = ax.plot(
-    [],
-    [],
-    'm-',
-    linewidth=1.2,
-    alpha=0.7,
-    label='IPS Path'
-)
-
-pf_plot, = ax.plot(
-    [],
-    [],
-    'rs',
-    markersize=6,
-    label='/pf/pose/odom Pose'
-)
-
-pf_trail_plot, = ax.plot(
-    [],
-    [],
-    'r-',
-    linewidth=1.5,
-    alpha=0.8,
-    label='/pf/pose/odom Path'
-)
-
-ax.set_title(
-    "Pure Pursuit Tracking & Odom Debugging"
-)
-
-ax.set_xlabel("X [m]")
-ax.set_ylabel("Y [m]")
-
-ax.legend(
-    loc='upper right'
-)
-
-ax.grid(True)
-
-ax.axis('equal')
-
-fig.canvas.draw()
-fig.canvas.flush_events()
+ips_trail_x = []
+ips_trail_y = []
 
 
-# -------------------------------------------------------------------------
-# Figure 2
-# -------------------------------------------------------------------------
+if ENABLE_PLOTTING:
 
-fig2, ax2 = plt.subplots(figsize=(8, 4))
+    plt.ion()
 
-target_speed_plot, = ax2.plot(
-    [],
-    [],
-    'g-',
-    linewidth=1.5,
-    label='Target Speed'
-)
+    fig, ax = plt.subplots(
+        figsize=(8, 8)
+    )
 
-actual_speed_plot, = ax2.plot(
-    [],
-    [],
-    'b-',
-    linewidth=1.5,
-    label='EKF Control Speed'
-)
+    ax.plot(
+        goal[:, 0],
+        goal[:, 1],
+        'k--',
+        label='CSV Path'
+    )
 
-odom_velx_plot, = ax2.plot(
-    [],
-    [],
-    'c--',
-    linewidth=1.2,
-    label='Wheel Vel X'
-)
+    localization_pose_plot, = ax.plot(
+        [],
+        [],
+        'ro',
+        markersize=8,
+        label='/localization/odom Control Pose'
+    )
 
-pf_speed_plot, = ax2.plot(
-    [],
-    [],
-    'r-',
-    linewidth=1.5,
-    label='PF Odom Speed'
-)
+    localization_trail_plot, = ax.plot(
+        [],
+        [],
+        'b-',
+        linewidth=1.8,
+        label='/localization/odom Path'
+    )
 
-ax2.set_title(
-    "Speed Tracking: Target vs EKF Speed"
-)
+    pf_pose_plot, = ax.plot(
+        [],
+        [],
+        'rs',
+        markersize=5,
+        label='PF Pose'
+    )
 
-ax2.set_xlabel("Time [s]")
-ax2.set_ylabel("Speed [m/s]")
+    pf_trail_plot, = ax.plot(
+        [],
+        [],
+        'r-',
+        linewidth=1.0,
+        alpha=0.65,
+        label='PF Path'
+    )
 
-ax2.legend(
-    loc='upper right'
-)
+    lookahead_plot, = ax.plot(
+        [],
+        [],
+        'go',
+        markersize=7,
+        label='Steering Lookahead'
+    )
 
-ax2.grid(True)
+    offset_lookahead_plot, = ax.plot(
+        [],
+        [],
+        'yo',
+        markersize=7,
+        label='Offset Lookahead'
+    )
 
-fig2.canvas.draw()
-fig2.canvas.flush_events()
+    sim_trail_plot, = ax.plot(
+        [],
+        [],
+        'c-',
+        linewidth=1.0,
+        alpha=0.7,
+        label='Simulator Odom Path'
+    )
+
+    ips_trail_plot, = ax.plot(
+        [],
+        [],
+        'm-',
+        linewidth=1.0,
+        alpha=0.7,
+        label='IPS Path'
+    )
+
+    ax.set_title(
+        'High-Rate Global Localization Pure Pursuit'
+    )
+
+    ax.set_xlabel(
+        'X [m]'
+    )
+
+    ax.set_ylabel(
+        'Y [m]'
+    )
+
+    ax.axis(
+        'equal'
+    )
+
+    ax.grid(
+        True
+    )
+
+    ax.legend(
+        loc='upper right'
+    )
+
+    fig2, ax2 = plt.subplots(
+        figsize=(8, 4)
+    )
+
+    target_speed_plot, = ax2.plot(
+        [],
+        [],
+        'g-',
+        linewidth=1.5,
+        label='Target Speed'
+    )
+
+    control_speed_plot, = ax2.plot(
+        [],
+        [],
+        'b-',
+        linewidth=1.5,
+        label='Localization/EKF Control Speed'
+    )
+
+    sim_speed_plot, = ax2.plot(
+        [],
+        [],
+        'c--',
+        linewidth=1.2,
+        label='Simulator Reference Speed'
+    )
+
+    pf_speed_plot, = ax2.plot(
+        [],
+        [],
+        'r-',
+        linewidth=1.2,
+        label='PF Published Speed'
+    )
+
+    ax2.set_title(
+        'Speed Tracking'
+    )
+
+    ax2.set_xlabel(
+        'Time [s]'
+    )
+
+    ax2.set_ylabel(
+        'Speed [m/s]'
+    )
+
+    ax2.grid(
+        True
+    )
+
+    ax2.legend(
+        loc='upper right'
+    )
 
 
 # ==========================================================================
-# CALLBACK FUNCTIONS
+# CALLBACKS
 # ==========================================================================
 
+def localization_odom_callback(msg):
 
-# -------------------------------------------------------------------------
-# Simulator wheel odometry callback
-# Used ONLY for plotting / comparison
-# -------------------------------------------------------------------------
+    global localization_position
+    global localization_speed
+    global localization_received
 
-def odom_callback(odom_msg):
-
-    global odom_postition
-    global odom_current_vel_x
-    global odom_current_vel_y
-    global odom_current_speed
-
-    odom_postition[0] = (
-        odom_msg.pose.pose.position.x
+    localization_position[0] = float(
+        msg.pose.pose.position.x
     )
 
-    odom_postition[1] = (
-        odom_msg.pose.pose.position.y
+    localization_position[1] = float(
+        msg.pose.pose.position.y
     )
 
-    odom_current_vel_x = (
-        odom_msg.twist.twist.linear.x
+    # global_odom_fuser copies fresh EKF twist into /localization/odom.
+    vx = float(
+        msg.twist.twist.linear.x
     )
 
-    odom_current_vel_y = (
-        odom_msg.twist.twist.linear.y
+    vy = float(
+        msg.twist.twist.linear.y
     )
 
-    odom_current_speed = math.sqrt(
-        odom_current_vel_x ** 2 +
-        odom_current_vel_y ** 2
+    localization_speed = math.hypot(
+        vx,
+        vy
     )
 
+    localization_received = True
 
-# -------------------------------------------------------------------------
-# Particle Filter Odometry callback
-#
-# Used for:
-#   Position -> CONTROL
-#   Speed    -> plotting / comparison only
-#
-# NOT used for yaw
-# -------------------------------------------------------------------------
+
+def yaw_callback(msg):
+
+    global car_yaw
+    global car_yaw_rate
+    global imu_received
+
+    q = msg.orientation
+
+    rotation = R.from_quat([
+        q.x,
+        q.y,
+        q.z,
+        q.w
+    ])
+
+    _, _, car_yaw = rotation.as_euler(
+        'xyz'
+    )
+
+    car_yaw_rate = float(
+        msg.angular_velocity.z
+    )
+
+    imu_received = True
+
 
 def pf_odom_callback(msg):
 
     global pf_odom_position
     global pf_odom_speed
-    global pf_odom_received
 
-    # -------------------------------------------------
-    # Position used for path tracking
-    # -------------------------------------------------
-
-    pf_odom_position[0] = (
+    pf_odom_position[0] = float(
         msg.pose.pose.position.x
     )
 
-    pf_odom_position[1] = (
+    pf_odom_position[1] = float(
         msg.pose.pose.position.y
     )
 
-    # -------------------------------------------------
-    # PF speed kept only for plotting / comparison.
-    # EKF speed is the control-speed source.
-    # -------------------------------------------------
-
-    vx = msg.twist.twist.linear.x
-
-    vy = msg.twist.twist.linear.y
-
-    pf_odom_speed = math.sqrt(
-        vx ** 2 +
-        vy ** 2
+    vx = float(
+        msg.twist.twist.linear.x
     )
 
-    pf_odom_received = True
+    vy = float(
+        msg.twist.twist.linear.y
+    )
+
+    pf_odom_speed = math.hypot(
+        vx,
+        vy
+    )
 
 
-# -------------------------------------------------------------------------
-# EKF odometry callback
-#
-# Used for:
-#   Speed -> CONTROL
-#
-# Position from this topic is NOT used for global path tracking.
-# -------------------------------------------------------------------------
+def simulator_odom_callback(msg):
 
-def ekf_odom_callback(msg):
+    global sim_odom_position
+    global sim_odom_speed
 
-    global ekf_speed
-    global ekf_speed_received
+    sim_odom_position[0] = float(
+        msg.pose.pose.position.x
+    )
 
-    vx = float(msg.twist.twist.linear.x)
-    vy = float(msg.twist.twist.linear.y)
+    sim_odom_position[1] = float(
+        msg.pose.pose.position.y
+    )
 
-    # Speed magnitude from the smooth 50 Hz EKF estimate.
-    # The vehicle races forward, but hypot() also makes this robust
-    # to a small lateral component in the EKF output.
-    ekf_speed = math.hypot(vx, vy)
+    vx = float(
+        msg.twist.twist.linear.x
+    )
 
-    ekf_speed_received = True
+    vy = float(
+        msg.twist.twist.linear.y
+    )
 
-
-# -------------------------------------------------------------------------
-# IPS callback
-#
-# Used ONLY for plotting / comparison
-# -------------------------------------------------------------------------
-
-def ips_callback(point_msg):
-
-    global postition
-
-    postition[0] = point_msg.x
-
-    postition[1] = point_msg.y
+    sim_odom_speed = math.hypot(
+        vx,
+        vy
+    )
 
 
-# -------------------------------------------------------------------------
-# IMU callback
-#
-# IMU is the ONLY source of yaw for control
-# -------------------------------------------------------------------------
+def ips_callback(msg):
 
-def yaw_callback(imu_msg):
+    global ips_position
 
-    global car_yaw
+    ips_position[0] = float(
+        msg.x
+    )
 
-    qx = imu_msg.orientation.x
-    qy = imu_msg.orientation.y
-    qz = imu_msg.orientation.z
-    qw = imu_msg.orientation.w
+    ips_position[1] = float(
+        msg.y
+    )
 
-    r = R.from_quat([
-        qx,
-        qy,
-        qz,
-        qw
+
+# ==========================================================================
+# PATH INDEXING
+# ==========================================================================
+
+def wrapped_indices(
+    center_idx,
+    behind,
+    ahead,
+    n
+):
+
+    return np.array([
+        (center_idx + offset) % n
+        for offset in range(
+            -behind,
+            ahead + 1
+        )
+    ], dtype=int)
+
+
+def update_nearest_path_index(
+    position,
+    previous_idx
+):
+
+    indices = wrapped_indices(
+        previous_idx,
+        NEAREST_SEARCH_BEHIND,
+        NEAREST_SEARCH_AHEAD,
+        path_len
+    )
+
+    local_points = goal[
+        indices
+    ]
+
+    distances = np.linalg.norm(
+        local_points - position,
+        axis=1
+    )
+
+    return int(
+        indices[
+            int(
+                np.argmin(distances)
+            )
+        ]
+    )
+
+
+def advance_path_index_by_distance(
+    start_idx,
+    distance_m
+):
+
+    idx = int(
+        start_idx
+    ) % path_len
+
+    travelled = 0.0
+
+    for _ in range(path_len):
+
+        if travelled >= distance_m:
+            break
+
+        next_idx = (
+            idx + 1
+        ) % path_len
+
+        travelled += float(
+            np.linalg.norm(
+                goal[next_idx] -
+                goal[idx]
+            )
+        )
+
+        idx = next_idx
+
+    return idx
+
+
+def find_steering_lookahead_index(
+    start_idx,
+    position,
+    desired_distance
+):
+
+    idx = int(
+        start_idx
+    ) % path_len
+
+    for _ in range(path_len):
+
+        if np.linalg.norm(
+            goal[idx] - position
+        ) >= desired_distance:
+            return idx
+
+        idx = (
+            idx + 1
+        ) % path_len
+
+    return idx
+
+
+# ==========================================================================
+# STEERING LATENCY COMPENSATION
+# ==========================================================================
+
+def predict_control_pose(
+    position,
+    yaw,
+    speed,
+    yaw_rate,
+    prediction_time
+):
+    """
+    Predict the vehicle pose forward to approximately where the vehicle will
+    be when the steering actuator has responded to the command being sent now.
+
+    The prediction is used ONLY for steering.  Speed-profile indexing remains
+    tied to the current /localization/odom position.
+
+    Motion model:
+      - straight-line prediction when yaw rate is nearly zero
+      - constant-yaw-rate circular-arc prediction otherwise
+    """
+
+    if prediction_time <= 0.0:
+        return (
+            position.copy(),
+            yaw
+        )
+
+    # Nearly straight motion.
+    if abs(yaw_rate) < 1e-4:
+
+        predicted_position = np.array([
+            position[0]
+            + speed
+            * prediction_time
+            * math.cos(yaw),
+
+            position[1]
+            + speed
+            * prediction_time
+            * math.sin(yaw)
+        ])
+
+        return (
+            predicted_position,
+            yaw
+        )
+
+    # Constant-yaw-rate circular arc.
+    predicted_yaw = (
+        yaw
+        + yaw_rate
+        * prediction_time
+    )
+
+    radius = (
+        speed /
+        yaw_rate
+    )
+
+    predicted_position = np.array([
+        position[0]
+        + radius
+        * (
+            math.sin(predicted_yaw)
+            - math.sin(yaw)
+        ),
+
+        position[1]
+        - radius
+        * (
+            math.cos(predicted_yaw)
+            - math.cos(yaw)
+        )
     ])
 
-    roll, pitch, car_yaw = r.as_euler('xyz')
+    predicted_yaw = math.atan2(
+        math.sin(predicted_yaw),
+        math.cos(predicted_yaw)
+    )
+
+    return (
+        predicted_position,
+        predicted_yaw
+    )
 
 
 # ==========================================================================
-# PURE PURSUIT FUNCTIONS
+# PURE PURSUIT
 # ==========================================================================
-
 
 def transformation(
-    xy_world_arr,
-    point_world_arr,
+    position_world,
+    point_world,
     yaw
 ):
 
-    R_T = np.array([
-        [
-            np.cos(yaw),
-            np.sin(yaw)
-        ],
-        [
-            -np.sin(yaw),
-            np.cos(yaw)
-        ]
-    ])
-
-    point_car_frame = (
-        R_T @
-        (point_world_arr - xy_world_arr)
+    c = math.cos(
+        yaw
     )
 
-    return point_car_frame
+    s = math.sin(
+        yaw
+    )
+
+    rotation_world_to_car = np.array([
+        [c, s],
+        [-s, c]
+    ])
+
+    return (
+        rotation_world_to_car @
+        (
+            point_world -
+            position_world
+        )
+    )
 
 
-def curvature_calc(xy_car_frame):
+def curvature_calc(
+    point_car_frame
+):
 
-    x = xy_car_frame[0]
+    x = float(
+        point_car_frame[0]
+    )
 
-    y = xy_car_frame[1]
+    y = float(
+        point_car_frame[1]
+    )
 
-    Lf_actual = math.hypot(
+    lookahead_actual = math.hypot(
         x,
         y
     )
 
-    if Lf_actual < 1e-6:
+    if lookahead_actual < 1e-6:
         return 0.0
 
-    curvature = (
-        2 * y
-    ) / (
-        Lf_actual * Lf_actual
+    return (
+        2.0 * y /
+        (
+            lookahead_actual *
+            lookahead_actual
+        )
     )
-
-    return curvature
 
 
 def compute_offset_lookahead(
     position,
-    pw_idx,
-    pd_idx,
-    path_xy,
-    path_curvature,
-    alpha_max,
-    beta_max
+    nearest_idx,
+    destination_idx
 ):
 
-    n = len(path_xy)
+    pw = goal[
+        nearest_idx
+    ]
 
-    pw = path_xy[pw_idx]
+    pd = goal[
+        destination_idx
+    ]
 
-    pd = path_xy[pd_idx]
+    p_wd = (
+        pd - pw
+    )
 
-    p_wd = pd - pw
-
-    len_wd = np.hypot(
-        p_wd[0],
-        p_wd[1]
+    len_wd = np.linalg.norm(
+        p_wd
     )
 
     theta_pwd = math.atan2(
@@ -626,300 +826,411 @@ def compute_offset_lookahead(
         p_wd[0]
     )
 
-    prev_idx = (
-        pw_idx - 1
-    ) % n
+    previous_idx = (
+        nearest_idx - 1
+    ) % path_len
 
     next_idx = (
-        pw_idx + 1
-    ) % n
+        nearest_idx + 1
+    ) % path_len
 
     tangent = (
-        path_xy[next_idx] -
-        path_xy[prev_idx]
+        goal[next_idx] -
+        goal[previous_idx]
     )
 
-    theta_pwl = math.atan2(
+    theta_path = math.atan2(
         tangent[1],
         tangent[0]
     )
 
-    theta = (
-        theta_pwl -
-        theta_pwd
-    )
-
     theta = math.atan2(
-        math.sin(theta),
-        math.cos(theta)
+        math.sin(
+            theta_path -
+            theta_pwd
+        ),
+        math.cos(
+            theta_path -
+            theta_pwd
+        )
     )
 
-    dist_v_pw = np.hypot(
-        position[0] - pw[0],
-        position[1] - pw[1]
+    distance_vehicle_to_pw = np.linalg.norm(
+        position - pw
     )
 
     alpha = min(
-        dist_v_pw / alpha_max,
+        distance_vehicle_to_pw /
+        ALPHA_MAX,
         1.0
     )
 
-    cur_pw = path_curvature[pw_idx]
+    curvature_here = path_curvature[
+        nearest_idx
+    ]
 
-    cur_pd = path_curvature[pd_idx]
+    curvature_destination = path_curvature[
+        destination_idx
+    ]
 
-    if cur_pw >= cur_pd:
-
+    if curvature_here >= curvature_destination:
         beta = 0.0
 
     elif (
-        cur_pd - cur_pw
-    ) < beta_max:
+        curvature_destination -
+        curvature_here
+    ) < BETA_MAX:
 
         beta = (
-            cur_pd - cur_pw
-        ) / beta_max
+            curvature_destination -
+            curvature_here
+        ) / BETA_MAX
 
     else:
-
         beta = 1.0
 
     tau = (
-        1.0 - alpha
+        1.0 -
+        alpha
     ) * beta
 
-    MAX_OFFSET_DIST = 0.45
-
-    len_dl = min(
+    offset_distance = min(
         len_wd *
-        math.tan(abs(theta)),
+        math.tan(
+            abs(theta)
+        ),
         MAX_OFFSET_DIST
     )
 
-    sign_theta = (
+    direction = (
         1.0
-        if theta >= 0
+        if theta >= 0.0
         else -1.0
     )
 
-    theta_dl = (
+    offset_angle = (
         theta_pwd +
-        sign_theta *
-        (math.pi / 2.0)
+        direction *
+        math.pi / 2.0
     )
 
-    p_l = np.array([
+    point = np.array([
         pd[0] +
         tau *
-        len_dl *
-        math.cos(theta_dl),
+        offset_distance *
+        math.cos(
+            offset_angle
+        ),
 
         pd[1] +
         tau *
-        len_dl *
-        math.sin(theta_dl)
+        offset_distance *
+        math.sin(
+            offset_angle
+        )
     ])
 
-    return p_l, tau
-
-
-def steering_func(
-    wh_base,
-    gamma
-):
-
-    steering_angle = np.arctan(
-        wh_base * gamma
-    )
-
-    return steering_angle
+    return point
 
 
 # ==========================================================================
-# THROTTLE
+# FEEDFORWARD THROTTLE
 # ==========================================================================
-
 
 def speed_control(
     target_speed
 ):
 
-    # Feedforward-only throttle law identified from the simulator's
-    # steady-state throttle-to-speed regression.
-    output = (
+    throttle = (
         K_FF *
         target_speed
     )
 
-    throttle = max(
-        min(output, 1.0),
-        0.0
+    return float(
+        np.clip(
+            throttle,
+            0.0,
+            1.0
+        )
     )
 
-    return throttle
 
+# ==========================================================================
+# PLOTTING
+# ==========================================================================
 
-def advance_path_index_by_distance(
-    start_idx,
-    path_xy,
-    distance_m
+def update_plots(
+    control_position,
+    offset_point,
+    steering_target_idx
 ):
-    """
-    Move forward along the CSV path by arc length.
 
-    This uses path distance, not Euclidean distance.  That is important
-    near bends, because a point that is geometrically close can be much
-    farther ahead along the racing line.
-    """
+    if not ENABLE_PLOTTING:
+        return
 
-    n = len(path_xy)
+    localization_pose_plot.set_data(
+        [control_position[0]],
+        [control_position[1]]
+    )
 
-    if n == 0:
-        return 0
+    localization_trail_plot.set_data(
+        localization_trail_x,
+        localization_trail_y
+    )
 
-    idx = int(start_idx) % n
-    travelled = 0.0
+    pf_pose_plot.set_data(
+        [pf_odom_position[0]],
+        [pf_odom_position[1]]
+    )
 
-    # Protect against a malformed path containing many zero-length
-    # segments by limiting traversal to one complete lap.
-    for _ in range(n):
+    pf_trail_plot.set_data(
+        pf_trail_x,
+        pf_trail_y
+    )
 
-        if travelled >= distance_m:
-            break
+    lookahead_plot.set_data(
+        [goal[steering_target_idx, 0]],
+        [goal[steering_target_idx, 1]]
+    )
 
-        next_idx = (idx + 1) % n
+    offset_lookahead_plot.set_data(
+        [offset_point[0]],
+        [offset_point[1]]
+    )
 
-        segment_length = float(
-            np.linalg.norm(
-                path_xy[next_idx] -
-                path_xy[idx]
-            )
-        )
+    sim_trail_plot.set_data(
+        sim_trail_x,
+        sim_trail_y
+    )
 
-        travelled += segment_length
-        idx = next_idx
+    ips_trail_plot.set_data(
+        ips_trail_x,
+        ips_trail_y
+    )
 
-    return idx
+    fig.canvas.draw_idle()
+    fig.canvas.flush_events()
+
+    target_speed_plot.set_data(
+        time_log,
+        target_speed_log
+    )
+
+    control_speed_plot.set_data(
+        time_log,
+        control_speed_log
+    )
+
+    sim_speed_plot.set_data(
+        time_log,
+        sim_speed_log
+    )
+
+    pf_speed_plot.set_data(
+        time_log,
+        pf_speed_log
+    )
+
+    ax2.relim()
+    ax2.autoscale_view()
+
+    fig2.canvas.draw_idle()
+    fig2.canvas.flush_events()
 
 
 # ==========================================================================
-# ROS 2 TIMER
+# CONTROL LOOP
 # ==========================================================================
-
 
 def timer_func(
     node,
-    st_pub,
-    thr_pub
+    steering_pub,
+    throttle_pub
 ):
 
-    global pf_odom_position
-    global car_yaw
-    global pf_odom_received
-    global ekf_speed
-    global ekf_speed_received
-    global count
-    global plot_counter
-    global look_ahead
-
-    global car_trail_x
-    global car_trail_y
-    global ips_trail_x
-    global ips_trail_y
-    global pf_trail_x
-    global pf_trail_y
-
-    global odom_current_vel_x
-    global odom_current_vel_y
-    global odom_current_speed
-    global pf_odom_speed
-
+    global control_counter
     global sim_time
-    global time_log
-    global target_speed_log
-    global actual_speed_log
-    global odom_velx_log
-    global pf_speed_log
+    global nearest_path_idx
+    global lookahead_idx
+    global speed_idx
 
-    global speed_count
+    if (
+        not localization_received
+        or not imu_received
+    ):
 
+        if (
+            control_counter %
+            LOG_EVERY_N
+        ) == 0:
 
-    # ----------------------------------------------------------------------
-    # ROS messages
-    # ----------------------------------------------------------------------
+            node.get_logger().warn(
+                'Waiting for /localization/odom and IMU...'
+            )
 
-    st = Float32()
-
-    thr = Float32()
-
-
-    # ----------------------------------------------------------------------
-    # Wait for the two control-state sources
-    # ----------------------------------------------------------------------
-
-    if not pf_odom_received or not ekf_speed_received:
-
-        node.get_logger().warn(
-            'Waiting for PF position and EKF speed before '
-            'publishing control commands...'
-        )
-
+        control_counter += 1
         return
 
-
-    # ----------------------------------------------------------------------
-    # CONTROL SOURCES
-    #
-    # Position -> Particle Filter       /pf/pose/odom
-    # Yaw      -> IMU                   /autodrive/roboracer_1/imu
-    # Speed    -> EKF                   /odometry/filtered
-    #
-    # PF speed remains available only for plotting / comparison.
-    # ----------------------------------------------------------------------
-
     control_position = (
-        pf_odom_position
+        localization_position.copy()
     )
 
-    control_yaw = (
+    control_speed = float(
+        localization_speed
+    )
+
+    control_yaw = float(
         car_yaw
     )
 
-    control_speed = (
-        ekf_speed
+
+    # ----------------------------------------------------------------------
+    # Track branch association.
+    # ----------------------------------------------------------------------
+
+    nearest_path_idx = update_nearest_path_index(
+        control_position,
+        nearest_path_idx
     )
 
 
     # ----------------------------------------------------------------------
-    # Current waypoint
+    # Steering with measured actuator-latency compensation.
+    #
+    # IMPORTANT:
+    #   - current global pose is still used for speed-profile indexing
+    #   - predicted pose is used ONLY for steering
     # ----------------------------------------------------------------------
 
-    start = count
+    steering_position, steering_yaw = (
+        predict_control_pose(
+            control_position,
+            control_yaw,
+            control_speed,
+            car_yaw_rate,
+            STEERING_LATENCY_COMP
+        )
+    )
 
-    search_end = min(
-        count + int(search_len),
-        path_len
+    # Associate the predicted steering pose with the same local branch of
+    # the racing line.  Do not overwrite the current nearest_path_idx because
+    # speed planning must remain tied to the actual localization pose.
+    steering_nearest_idx = update_nearest_path_index(
+        steering_position,
+        nearest_path_idx
+    )
+
+    steering_lookahead = float(
+        np.clip(
+            STEER_LOOKAHEAD_GAIN *
+            control_speed,
+            STEER_LOOKAHEAD_MIN,
+            STEER_LOOKAHEAD_MAX
+        )
+    )
+
+    lookahead_idx = find_steering_lookahead_index(
+        steering_nearest_idx,
+        steering_position,
+        steering_lookahead
+    )
+
+    offset_point = compute_offset_lookahead(
+        steering_position,
+        steering_nearest_idx,
+        lookahead_idx
+    )
+
+    point_car_frame = transformation(
+        steering_position,
+        offset_point,
+        steering_yaw
+    )
+
+    curvature_command = curvature_calc(
+        point_car_frame
+    )
+
+    steering_angle = math.atan(
+        WHEELBASE *
+        curvature_command
+    )
+
+    normalized_steering = float(
+        np.clip(
+            steering_angle /
+            MAX_STEERING_RAD,
+            -1.0,
+            1.0
+        )
     )
 
 
     # ----------------------------------------------------------------------
-    # Trails for plotting
+    # Feedforward target-speed preview.
+    #
+    # Speed is used only to choose how far forward in the CSV to read.
+    # It is NOT used as throttle feedback.
     # ----------------------------------------------------------------------
 
-    ips_trail_x.append(
-        postition[0]
+    speed_preview_distance = float(
+        np.clip(
+            SPEED_PREVIEW_BASE +
+            SPEED_PREVIEW_TIME *
+            control_speed,
+            SPEED_PREVIEW_MIN,
+            SPEED_PREVIEW_MAX
+        )
     )
 
-    ips_trail_y.append(
-        postition[1]
+    speed_idx = advance_path_index_by_distance(
+        nearest_path_idx,
+        speed_preview_distance
     )
 
-    car_trail_x.append(
-        odom_postition[0]
+    target_velocity = float(
+        vel_profile[
+            speed_idx
+        ] /
+        VELOCITY_DIVISOR
     )
 
-    car_trail_y.append(
-        odom_postition[1]
+    throttle_command = speed_control(
+        target_velocity
+    )
+
+
+    # ----------------------------------------------------------------------
+    # Publish.
+    # ----------------------------------------------------------------------
+
+    steering_msg = Float32()
+    steering_msg.data = normalized_steering
+
+    throttle_msg = Float32()
+    throttle_msg.data = throttle_command
+
+    steering_pub.publish(
+        steering_msg
+    )
+
+    throttle_pub.publish(
+        throttle_msg
+    )
+
+
+    # ----------------------------------------------------------------------
+    # Diagnostics.
+    # ----------------------------------------------------------------------
+
+    sim_time += CONTROL_PERIOD
+
+    localization_trail_x.append(
+        control_position[0]
+    )
+
+    localization_trail_y.append(
+        control_position[1]
     )
 
     pf_trail_x.append(
@@ -930,405 +1241,114 @@ def timer_func(
         pf_odom_position[1]
     )
 
-
-    node.get_logger().info(
-        "Publishing : >_<"
+    sim_trail_x.append(
+        sim_odom_position[0]
     )
 
-
-    # ----------------------------------------------------------------------
-    # Search for lookahead point
-    # ----------------------------------------------------------------------
-
-    search_indices = [
-        (count + i) % path_len
-        for i in range(int(search_len))
-    ]
-
-    search_goals = goal[
-        search_indices
-    ]
-
-
-    check_distance = np.linalg.norm(
-        search_goals -
-        control_position,
-        axis=1
+    sim_trail_y.append(
+        sim_odom_position[1]
     )
 
-
-    nearest_idx = np.where(
-        check_distance >= look_ahead
-    )[0]
-
-
-    if len(nearest_idx) > 0:
-
-        count = search_indices[
-            nearest_idx[0]
-        ]
-
-    else:
-
-        count = (
-            count + 1
-        ) % path_len
-
-
-    if count >= path_len:
-
-        count = 10
-
-
-    # ----------------------------------------------------------------------
-    # Find nearest waypoint for offset lookahead and speed preview
-    # ----------------------------------------------------------------------
-
-    pw_idx = int(
-        np.argmin(
-            np.sqrt(
-                (goal[:, 0] -
-                 control_position[0]) ** 2 +
-
-                (goal[:, 1] -
-                 control_position[1]) ** 2
-            )
-        )
+    ips_trail_x.append(
+        ips_position[0]
     )
 
-
-    # ----------------------------------------------------------------------
-    # Dynamic feedforward speed-profile preview
-    #
-    # Small-scale-car tuning:
-    #   1.0 m/s -> 0.37 m
-    #   3.0 m/s -> 0.81 m
-    #   5.0 m/s -> 1.25 m
-    #   5.8 m/s -> 1.43 m
-    #
-    # Only the point sampled from the CSV moves forward.  Throttle remains
-    # the same feedforward law: throttle = 0.04131 * target_velocity.
-    # There is no PID and no throttle cut.
-    # ----------------------------------------------------------------------
-
-    speed_preview_distance = float(
-        np.clip(
-            SPEED_PREVIEW_BASE +
-            SPEED_PREVIEW_TIME * control_speed,
-            SPEED_PREVIEW_MIN,
-            SPEED_PREVIEW_MAX
-        )
+    ips_trail_y.append(
+        ips_position[1]
     )
-
-    speed_count = advance_path_index_by_distance(
-        pw_idx,
-        goal,
-        speed_preview_distance
-    )
-
-
-    p_l, tau_val = (
-        compute_offset_lookahead(
-            control_position,
-            pw_idx,
-            count,
-            goal,
-            path_curvature,
-            ALPHA_MAX,
-            BETA_MAX
-        )
-    )
-
-
-    # ======================================================================
-    # 1. STEERING
-    #
-    # Position = PF
-    # Yaw      = IMU
-    # ======================================================================
-
-    xy_cf = transformation(
-        control_position,
-        p_l,
-        control_yaw
-    )
-
-    curve = curvature_calc(
-        xy_cf
-    )
-
-    steer = (
-        steering_func(
-            wheelbase,
-            curve
-        )
-        / 0.5236
-    )
-
-    st.data = float(
-        steer
-    )
-
-
-    # ======================================================================
-    # 2. THROTTLE
-    #
-    # Throttle = feedforward from CSV target speed
-    # EKF speed is NOT fed back into throttle
-    # ======================================================================
-
-    target_velocity = (
-        vel_profile[speed_count]
-        / 1.7
-    )
-
-    look_ahead = np.clip(
-        0.45 * control_speed,
-        0.7,
-        2.0
-    )
-
-
-    throttle_cmd = speed_control(
-        target_velocity
-    )
-
-    thr.data = float(
-        throttle_cmd
-    )
-
-
-    # ----------------------------------------------------------------------
-    # Publish commands
-    # ----------------------------------------------------------------------
-
-    st_pub.publish(
-        st
-    )
-
-    thr_pub.publish(
-        thr
-    )
-
-
-    # ======================================================================
-    # LOGGING
-    # ======================================================================
-
-    sim_time += 0.01
 
     time_log.append(
         sim_time
     )
 
     target_speed_log.append(
-        float(target_velocity)
+        target_velocity
     )
 
-    actual_speed_log.append(
-        float(control_speed)
+    control_speed_log.append(
+        control_speed
     )
 
-    odom_velx_log.append(
-        float(odom_current_vel_x)
+    sim_speed_log.append(
+        sim_odom_speed
     )
 
     pf_speed_log.append(
-        float(pf_odom_speed)
+        pf_odom_speed
     )
 
-
-    if len(time_log) > MAX_SPEED_POINTS:
+    if len(
+        time_log
+    ) > MAX_SPEED_POINTS:
 
         del time_log[0]
-
         del target_speed_log[0]
-
-        del actual_speed_log[0]
-
-        del odom_velx_log[0]
-
+        del control_speed_log[0]
+        del sim_speed_log[0]
         del pf_speed_log[0]
 
 
-    # ======================================================================
-    # PLOTTING
-    # ======================================================================
+    if (
+        control_counter %
+        LOG_EVERY_N
+    ) == 0:
 
-    plot_counter += 1
-
-
-    if plot_counter % 10 == 0:
-
-        # PF control pose
-        car_plot.set_data(
-            [control_position[0]],
-            [control_position[1]]
-        )
-
-        # Lookahead point
-        target_plot.set_data(
-            [goal[count, 0]],
-            [goal[count, 1]]
-        )
-
-        # IPS path
-        ips_trail_plot.set_data(
-            ips_trail_x,
-            ips_trail_y
-        )
-
-        # Offset lookahead
-        offset_lk.set_data(
-            [p_l[0]],
-            [p_l[1]]
-        )
-
-        # Wheel odometry
-        ips_plot.set_data(
-            [odom_postition[0]],
-            [odom_postition[1]]
-        )
-
-        trail_plot.set_data(
-            car_trail_x,
-            car_trail_y
-        )
-
-        # PF odometry
-        pf_plot.set_data(
-            [pf_odom_position[0]],
-            [pf_odom_position[1]]
-        )
-
-        pf_trail_plot.set_data(
-            pf_trail_x,
-            pf_trail_y
+        node.get_logger().info(
+            f'v={control_speed:.2f} m/s, '
+            f'target={target_velocity:.2f} m/s, '
+            f'throttle={throttle_command:.3f}, '
+            f'steer={normalized_steering:.3f}, '
+            f'steer_L={steering_lookahead:.2f} m, '
+            f'speed_preview={speed_preview_distance:.2f} m, '
+            f'latency_comp={STEERING_LATENCY_COMP:.2f} s, '
+            f'idx={nearest_path_idx}'
         )
 
 
-        fig.canvas.draw_idle()
+    if (
+        ENABLE_PLOTTING
+        and
+        control_counter %
+        PLOT_EVERY_N
+        == 0
+    ):
 
-        fig.canvas.flush_events()
-
-
-        # Speed plots
-        target_speed_plot.set_data(
-            time_log,
-            target_speed_log
-        )
-
-        actual_speed_plot.set_data(
-            time_log,
-            actual_speed_log
-        )
-
-        odom_velx_plot.set_data(
-            time_log,
-            odom_velx_log
-        )
-
-        pf_speed_plot.set_data(
-            time_log,
-            pf_speed_log
+        update_plots(
+            control_position,
+            offset_point,
+            lookahead_idx
         )
 
 
-        ax2.relim()
-
-        ax2.autoscale_view()
-
-
-        fig2.canvas.draw_idle()
-
-        fig2.canvas.flush_events()
-
-
-    # ======================================================================
-    # DEBUG LOG
-    # ======================================================================
-
-    node.get_logger().info(
-        f"IMU yaw angle : "
-        f"{round(control_yaw, 3)}"
-    )
-
-    node.get_logger().info(
-        f"steering command value : "
-        f"{round(steer, 3)} >_<"
-    )
-
-    node.get_logger().info(
-        f"throttle command value : "
-        f"{throttle_cmd} >_<"
-    )
-
-    node.get_logger().info(
-        f"Lookahead : "
-        f"{look_ahead} >_<"
-    )
-
-    node.get_logger().info(
-        f"Speed preview : "
-        f"{round(speed_preview_distance, 3)} m, "
-        f"speed index : {speed_count} >_<"
-    )
-
-    node.get_logger().info(
-        f"index : "
-        f"{count} >_<"
-    )
+    control_counter += 1
 
 
 # ==========================================================================
 # MAIN
 # ==========================================================================
 
-
-def main(args=None):
+def main(
+    args=None
+):
 
     rclpy.init(
         args=args
     )
 
-    my_node = rclpy.create_node(
+    node = rclpy.create_node(
         'pps_icra_2026'
     )
 
 
-    # ----------------------------------------------------------------------
-    # Simulator wheel odometry
-    # Comparison / plotting ONLY
-    # ----------------------------------------------------------------------
-
-    car_odom = my_node.create_subscription(
+    # CONTROL STATE
+    localization_sub = node.create_subscription(
         Odometry,
-        '/autodrive/roboracer_1/odom',
-        odom_callback,
+        '/localization/odom',
+        localization_odom_callback,
         10
     )
 
-
-    # ----------------------------------------------------------------------
-    # IPS
-    # Comparison / plotting ONLY
-    # ----------------------------------------------------------------------
-
-    car_pose = my_node.create_subscription(
-        Point,
-        '/autodrive/roboracer_1/ips',
-        ips_callback,
-        10
-    )
-
-
-    # ----------------------------------------------------------------------
-    # IMU
-    #
-    # THIS IS THE YAW SOURCE FOR CONTROL
-    # ----------------------------------------------------------------------
-
-    imu_sub = my_node.create_subscription(
+    imu_sub = node.create_subscription(
         Imu,
         '/autodrive/roboracer_1/imu',
         yaw_callback,
@@ -1336,112 +1356,98 @@ def main(args=None):
     )
 
 
-    # ----------------------------------------------------------------------
-    # Particle Filter Odometry
-    #
-    # Position -> control
-    # Speed    -> plotting / comparison only
-    # ----------------------------------------------------------------------
-
-    pf_odom_sub = my_node.create_subscription(
+    # DIAGNOSTIC SOURCES
+    pf_sub = node.create_subscription(
         Odometry,
         '/pf/pose/odom',
         pf_odom_callback,
         10
     )
 
-
-    # ----------------------------------------------------------------------
-    # EKF Odometry
-    #
-    # Speed -> control
-    # ----------------------------------------------------------------------
-
-    ekf_odom_sub = my_node.create_subscription(
+    simulator_odom_sub = node.create_subscription(
         Odometry,
-        '/odometry/filtered',
-        ekf_odom_callback,
+        '/autodrive/roboracer_1/odom',
+        simulator_odom_callback,
+        10
+    )
+
+    ips_sub = node.create_subscription(
+        Point,
+        '/autodrive/roboracer_1/ips',
+        ips_callback,
         10
     )
 
 
-    # ----------------------------------------------------------------------
-    # Steering publisher
-    # ----------------------------------------------------------------------
-
-    steer_pub = my_node.create_publisher(
+    # COMMAND OUTPUTS
+    steering_pub = node.create_publisher(
         Float32,
         '/autodrive/roboracer_1/steering_command',
         10
     )
 
-
-    # ----------------------------------------------------------------------
-    # Throttle publisher
-    # ----------------------------------------------------------------------
-
-    throttle_pub = my_node.create_publisher(
+    throttle_pub = node.create_publisher(
         Float32,
         '/autodrive/roboracer_1/throttle_command',
         10
     )
 
 
-    # ----------------------------------------------------------------------
-    # Control loop
-    # ----------------------------------------------------------------------
-
-    timer = my_node.create_timer(
-        0.01,
+    timer = node.create_timer(
+        CONTROL_PERIOD,
         lambda: timer_func(
-            my_node,
-            steer_pub,
+            node,
+            steering_pub,
             throttle_pub
         )
     )
 
 
-    # ----------------------------------------------------------------------
-    # Spin
-    # ----------------------------------------------------------------------
-
-    rclpy.spin(
-        my_node
+    node.get_logger().info(
+        'High-rate global localization controller started. '
+        f'control={1.0 / CONTROL_PERIOD:.1f} Hz, '
+        f'velocity_divisor={VELOCITY_DIVISOR:.2f}, '
+        f'preview_max={SPEED_PREVIEW_MAX:.2f} m, '
+        f'steering_latency_comp={STEERING_LATENCY_COMP:.2f} s, '
+        f'plotting={ENABLE_PLOTTING}'
     )
 
 
-    # ----------------------------------------------------------------------
-    # Shutdown / save path
-    # ----------------------------------------------------------------------
+    try:
+        rclpy.spin(
+            node
+        )
 
-    plt.close(
-        'all'
-    )
+    except KeyboardInterrupt:
+        pass
 
-    np.savetxt(
-        '/home/autodrive_devkit/actual_path.csv',
-        np.column_stack(
-            (
-                car_trail_x,
-                car_trail_y
+    finally:
+
+        if ENABLE_PLOTTING:
+            plt.close(
+                'all'
             )
-        ),
-        delimiter=',',
-        header='x,y',
-        comments=''
-    )
 
+        np.savetxt(
+            '/home/autodrive_devkit/localization_control_path.csv',
+            np.column_stack((
+                localization_trail_x,
+                localization_trail_y
+            )),
+            delimiter=',',
+            header='x,y',
+            comments=''
+        )
 
-    my_node.destroy_timer(
-        timer
-    )
+        node.destroy_timer(
+            timer
+        )
 
-    my_node.destroy_node()
+        node.destroy_node()
 
-    rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':
-
     main()
-
