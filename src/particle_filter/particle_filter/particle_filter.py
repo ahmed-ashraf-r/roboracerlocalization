@@ -126,9 +126,18 @@ class ParticleFiler(Node):
         # Lateral/yaw noise remain small so the corridor walls still constrain
         # the car cleanly.
         # ------------------------------------------------------------------
-        self.declare_parameter('motion_noise_long_accel_gain', 0.010)
-        self.declare_parameter('motion_noise_long_accel_cap', 0.070)
+        self.declare_parameter('motion_noise_long_accel_gain', 0.015)
+        self.declare_parameter('motion_noise_long_accel_cap', 0.100)
         self.declare_parameter('motion_accel_cap', 8.0)
+
+        # A very small longitudinal recovery tail keeps alternative progress
+        # hypotheses alive in the long corridor during high-speed acceleration.
+        # Only a few percent of particles are affected, and only along the
+        # vehicle longitudinal axis.
+        self.declare_parameter('recovery_tail_ratio', 0.03)
+        self.declare_parameter('recovery_tail_sigma', 0.22)
+        self.declare_parameter('recovery_tail_accel_threshold', 1.50)
+        self.declare_parameter('recovery_tail_speed_threshold', 4.50)
 
         # ------------------------------------------------------------------
         # High-speed synchronization / LiDAR deskew
@@ -187,6 +196,19 @@ class ParticleFiler(Node):
         )
         self.MOTION_ACCEL_CAP = float(
             self.get_parameter('motion_accel_cap').value
+        )
+
+        self.RECOVERY_TAIL_RATIO = float(
+            self.get_parameter('recovery_tail_ratio').value
+        )
+        self.RECOVERY_TAIL_SIGMA = float(
+            self.get_parameter('recovery_tail_sigma').value
+        )
+        self.RECOVERY_TAIL_ACCEL_THRESHOLD = float(
+            self.get_parameter('recovery_tail_accel_threshold').value
+        )
+        self.RECOVERY_TAIL_SPEED_THRESHOLD = float(
+            self.get_parameter('recovery_tail_speed_threshold').value
         )
 
         self.ENABLE_LIDAR_DESKEW = bool(
@@ -283,6 +305,7 @@ class ParticleFiler(Node):
         self.last_motion_speed = None
         self.current_motion_accel = 0.0
         self.current_motion_dt = 0.0
+        self.last_recovery_tail_count = 0
 
         self.current_speed = 0.0
         self.current_wz = 0.0
@@ -379,7 +402,7 @@ class ParticleFiler(Node):
 
         self.get_logger().info(
             'High-speed PF ready: synchronized EKF history, scan-midpoint motion, '
-            f'LiDAR deskew={self.ENABLE_LIDAR_DESKEW}, ESS-gated resampling enabled, racing_v2=N{self.MAX_PARTICLES}/step{self.ANGLE_STEP}/theta{self.THETA_DISCRETIZATION}.'
+            f'LiDAR deskew={self.ENABLE_LIDAR_DESKEW}, ESS-gated resampling enabled, racing_v3=N{self.MAX_PARTICLES}/step{self.ANGLE_STEP}/theta{self.THETA_DISCRETIZATION}.'
         )
 
     # ======================================================================
@@ -1120,6 +1143,45 @@ class ParticleFiler(Node):
         noise_long = np.random.normal(0.0, sigma_long, self.MAX_PARTICLES)
         noise_lat = np.random.normal(0.0, sigma_lat, self.MAX_PARTICLES)
 
+        # Racing V3 recovery tail.
+        #
+        # During high-speed acceleration in a longitudinally ambiguous corridor,
+        # keep a small set of alternative forward/back hypotheses alive.
+        # This is deliberately sparse so the PF mean remains stable.
+        self.last_recovery_tail_count = 0
+
+        if (
+            self.current_motion_accel >= self.RECOVERY_TAIL_ACCEL_THRESHOLD
+            and
+            self.current_speed >= self.RECOVERY_TAIL_SPEED_THRESHOLD
+            and
+            self.RECOVERY_TAIL_RATIO > 0.0
+            and
+            self.RECOVERY_TAIL_SIGMA > 0.0
+        ):
+            recovery_mask = (
+                np.random.random(self.MAX_PARTICLES)
+                <
+                self.RECOVERY_TAIL_RATIO
+            )
+
+            recovery_count = int(
+                np.count_nonzero(
+                    recovery_mask
+                )
+            )
+
+            if recovery_count > 0:
+                noise_long[recovery_mask] += np.random.normal(
+                    0.0,
+                    self.RECOVERY_TAIL_SIGMA,
+                    recovery_count
+                )
+
+            self.last_recovery_tail_count = (
+                recovery_count
+            )
+
         proposal_dist[:, 0] += c * noise_long - s * noise_lat
         proposal_dist[:, 1] += s * noise_long + c * noise_lat
         proposal_dist[:, 2] += np.random.normal(
@@ -1399,6 +1461,8 @@ class ParticleFiler(Node):
                 f'compute_capacity={self.smoothing.mean():.1f}/s, '
                 f'N_eff={self.last_neff:.1f}/{self.MAX_PARTICLES}, '
                 f'resampled={self.last_resampled}, '
+                f'accel={self.current_motion_accel:.2f}m/s2, '
+                f'recovery_tail={self.last_recovery_tail_count}, '
                 f'deskew={self.ENABLE_LIDAR_DESKEW}, '
                 f'scan_span={scan_span_ms:.2f}ms, '
                 f'vx={self.current_speed:.2f}m/s, wz={self.current_wz:.2f}rad/s'

@@ -39,7 +39,7 @@ particle_filter:
     max_odom_yaw_rate: 20.0
 
     # ============================================================
-    # RACING V2 PARTICLES / RANGE LIBRARY
+    # RACING V3 PARTICLES / RANGE LIBRARY
     # Goal: lower LiDAR->PF latency while retaining more rays than the
     # original 2000/step12 configuration.
     # 2500 particles + ~109 LiDAR rays/update.
@@ -79,9 +79,15 @@ particle_filter:
 
     # Adaptive longitudinal diversity for corridor/high-dynamics sections.
     # Extra sigma_long = min(cap, gain * |estimated acceleration|).
-    motion_noise_long_accel_gain: 0.010
-    motion_noise_long_accel_cap: 0.070
+    motion_noise_long_accel_gain: 0.015
+    motion_noise_long_accel_cap: 0.100
     motion_accel_cap: 8.0
+
+    # Sparse longitudinal recovery hypotheses for high-speed corridor runs.
+    recovery_tail_ratio: 0.03
+    recovery_tail_sigma: 0.22
+    recovery_tail_accel_threshold: 1.50
+    recovery_tail_speed_threshold: 4.50
 
     # ============================================================
     # ESS RESAMPLING

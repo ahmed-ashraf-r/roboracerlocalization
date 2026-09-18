@@ -155,44 +155,81 @@ class AckermannOdom(Node):
         )
 
         # ------------------------------------------------------------------
-        # V2: bounded wheel lower-bound during strong acceleration
+        # V3: innovation-limited wheel correction during acceleration
         #
-        # The wheel-only rosbag showed:
-        #   - wheel speed is excellent during steady/coast/braking
-        #   - during hard acceleration, wheel speed commonly leads true
-        #     chassis speed by roughly 2 m/s or more
+        # At /1.15 the IMU-only prediction can under-estimate chassis speed,
+        # but raw wheel speed can over-estimate it because of wheel spin.
         #
-        # V1 completely ignored wheels at high positive acceleration.  That
-        # made lap 1 excellent, but lap 2 could accumulate ~0.8 m of
-        # under-distance from pure IMU integration.
+        # Instead of trusting either signal completely:
         #
-        # V2 never trusts the spinning wheel directly.  Instead it forms a
-        # conservative lower-bound:
+        #   1) IMU predicts speed.
+        #   2) wheel acceleration is compared with IMU acceleration.
+        #   3) large positive wheel-acceleration excess is treated as spin.
+        #   4) wheel-speed innovation is clipped.
+        #   5) only a bounded correction is allowed each 50-Hz cycle.
         #
-        #     wheel_floor = wheel_speed - accel_slip_margin
-        #
-        # and only nudges the hybrid speed upward if it falls below that
-        # lower-bound.  The correction is deliberately very small and capped.
+        # This lets the wheels correct slow IMU drift without allowing wheel
+        # spin to drag odometry metres ahead.
         # ------------------------------------------------------------------
 
         self.declare_parameter(
-            "accel_floor_activation",
+            "positive_accel_threshold",
+            0.30
+        )
+
+        # wheel_accel - imu_accel below this is treated as low-slip.
+        self.declare_parameter(
+            "spin_excess_accel_low",
+            0.75
+        )
+
+        # Above this value, use the severe-spin correction limits.
+        self.declare_parameter(
+            "spin_excess_accel_high",
+            3.00
+        )
+
+        # Wheel correction gain when wheel/IMU acceleration agree.
+        self.declare_parameter(
+            "accel_wheel_gain_low_spin",
+            0.20
+        )
+
+        # Wheel correction gain under obvious wheel spin.
+        self.declare_parameter(
+            "accel_wheel_gain_high_spin",
+            0.025
+        )
+
+        # Never let positive wheel innovation exceed this value before gain.
+        self.declare_parameter(
+            "positive_wheel_innovation_cap",
+            1.25
+        )
+
+        # Negative wheel innovation is useful for preventing over-estimation.
+        self.declare_parameter(
+            "negative_wheel_innovation_cap",
             1.50
         )
 
+        # Per-cycle speed correction caps at 50 Hz.
         self.declare_parameter(
-            "accel_slip_margin",
-            2.50
+            "accel_correction_step_low_spin",
+            0.030
         )
 
         self.declare_parameter(
-            "accel_floor_alpha",
-            0.05
+            "accel_correction_step_high_spin",
+            0.010
         )
 
+        # Slight positive-acceleration scale.  Most correction still comes
+        # from bounded wheel innovation rather than a large hard-coded IMU
+        # multiplier.
         self.declare_parameter(
-            "accel_floor_max_step",
-            0.025
+            "positive_imu_accel_scale",
+            1.05
         )
 
         self.declare_parameter(
@@ -223,27 +260,63 @@ class AckermannOdom(Node):
             ).value
         )
 
-        self.accel_floor_activation = float(
+        self.positive_accel_threshold = float(
             self.get_parameter(
-                "accel_floor_activation"
+                "positive_accel_threshold"
             ).value
         )
 
-        self.accel_slip_margin = float(
+        self.spin_excess_accel_low = float(
             self.get_parameter(
-                "accel_slip_margin"
+                "spin_excess_accel_low"
             ).value
         )
 
-        self.accel_floor_alpha = float(
+        self.spin_excess_accel_high = float(
             self.get_parameter(
-                "accel_floor_alpha"
+                "spin_excess_accel_high"
             ).value
         )
 
-        self.accel_floor_max_step = float(
+        self.accel_wheel_gain_low_spin = float(
             self.get_parameter(
-                "accel_floor_max_step"
+                "accel_wheel_gain_low_spin"
+            ).value
+        )
+
+        self.accel_wheel_gain_high_spin = float(
+            self.get_parameter(
+                "accel_wheel_gain_high_spin"
+            ).value
+        )
+
+        self.positive_wheel_innovation_cap = float(
+            self.get_parameter(
+                "positive_wheel_innovation_cap"
+            ).value
+        )
+
+        self.negative_wheel_innovation_cap = float(
+            self.get_parameter(
+                "negative_wheel_innovation_cap"
+            ).value
+        )
+
+        self.accel_correction_step_low_spin = float(
+            self.get_parameter(
+                "accel_correction_step_low_spin"
+            ).value
+        )
+
+        self.accel_correction_step_high_spin = float(
+            self.get_parameter(
+                "accel_correction_step_high_spin"
+            ).value
+        )
+
+        self.positive_imu_accel_scale = float(
+            self.get_parameter(
+                "positive_imu_accel_scale"
             ).value
         )
 
@@ -381,10 +454,14 @@ class AckermannOdom(Node):
         self.last_wheel_trust = 1.0
         self.last_accel_used = 0.0
 
-        # V2 diagnostics.
-        self.last_accel_floor = 0.0
-        self.last_accel_floor_correction = 0.0
-        self.accel_floor_active = False
+        # V3 diagnostics.
+        self.previous_wheel_speed_for_accel = None
+        self.last_wheel_accel = 0.0
+        self.last_spin_excess = 0.0
+        self.last_spin_factor = 0.0
+        self.last_wheel_innovation = 0.0
+        self.last_accel_wheel_gain = 0.0
+        self.last_accel_correction = 0.0
 
         # ==================================================================
         # ODOMETRY STATE
@@ -452,6 +529,38 @@ class AckermannOdom(Node):
             20
         )
 
+        # Lightweight V3 diagnostics.  These are valuable for the next bag
+        # and have negligible effect on the control loop.
+        self.debug_hybrid_speed_pub = self.create_publisher(
+            Float32,
+            "/roboracer/odom_debug/hybrid_speed",
+            10
+        )
+
+        self.debug_wheel_speed_pub = self.create_publisher(
+            Float32,
+            "/roboracer/odom_debug/wheel_speed",
+            10
+        )
+
+        self.debug_imu_accel_pub = self.create_publisher(
+            Float32,
+            "/roboracer/odom_debug/imu_accel",
+            10
+        )
+
+        self.debug_wheel_innovation_pub = self.create_publisher(
+            Float32,
+            "/roboracer/odom_debug/wheel_innovation",
+            10
+        )
+
+        self.debug_spin_excess_pub = self.create_publisher(
+            Float32,
+            "/roboracer/odom_debug/spin_excess",
+            10
+        )
+
         # 50 Hz output / integration.
         self.timer = self.create_timer(
             0.02,
@@ -473,12 +582,12 @@ class AckermannOdom(Node):
         self.odom_msg.child_frame_id = "roboracer_1"
 
         self.get_logger().info(
-            "Ackermann Odom IMU-HYBRID V2 started: "
-            f"wheel_trust ax=[{self.accel_low:.2f}, "
-            f"{self.accel_high:.2f}], "
-            f"wheel_gain={self.wheel_correction_gain:.2f}, "
-            f"accel_floor_margin={self.accel_slip_margin:.2f} m/s, "
-            f"floor_alpha={self.accel_floor_alpha:.2f}"
+            "Ackermann Odom IMU-HYBRID V3 started: "
+            f"steady_wheel_gain={self.wheel_correction_gain:.2f}, "
+            f"accel_gain=[{self.accel_wheel_gain_low_spin:.3f}, "
+            f"{self.accel_wheel_gain_high_spin:.3f}], "
+            f"spin_excess=[{self.spin_excess_accel_low:.2f}, "
+            f"{self.spin_excess_accel_high:.2f}] m/s^2"
         )
 
     # ======================================================================
@@ -913,23 +1022,90 @@ class AckermannOdom(Node):
             accel
         )
 
+        if accel > self.positive_accel_threshold:
+            accel_for_prediction = (
+                accel *
+                self.positive_imu_accel_scale
+            )
+        else:
+            accel_for_prediction = accel
+
         predicted_speed = (
             self.vehicle_speed
             +
-            accel
+            accel_for_prediction
             *
             dt
         )
 
-        # RoboRacer is forward-only here.
         predicted_speed = max(
             0.0,
             predicted_speed
         )
 
         # ------------------------------------------------------------------
-        # Asymmetric wheel correction
+        # V3 wheel acceleration / spin estimation
         # ------------------------------------------------------------------
+
+        if self.previous_wheel_speed_for_accel is None:
+            wheel_accel = 0.0
+        else:
+            wheel_accel = (
+                wheel_speed
+                -
+                self.previous_wheel_speed_for_accel
+            ) / dt
+
+        self.previous_wheel_speed_for_accel = (
+            wheel_speed
+        )
+
+        self.last_wheel_accel = (
+            wheel_accel
+        )
+
+        spin_excess = max(
+            0.0,
+            wheel_accel
+            -
+            accel_for_prediction
+        )
+
+        self.last_spin_excess = (
+            spin_excess
+        )
+
+        spin_denominator = max(
+            1e-6,
+            self.spin_excess_accel_high
+            -
+            self.spin_excess_accel_low
+        )
+
+        spin_factor = float(
+            clamp(
+                (
+                    spin_excess
+                    -
+                    self.spin_excess_accel_low
+                )
+                /
+                spin_denominator,
+                0.0,
+                1.0
+            )
+        )
+
+        self.last_spin_factor = (
+            spin_factor
+        )
+
+        # ------------------------------------------------------------------
+        # Asymmetric fusion
+        # ------------------------------------------------------------------
+
+        self.last_accel_correction = 0.0
+        self.last_accel_wheel_gain = 0.0
 
         if (
             left_fresh
@@ -937,105 +1113,104 @@ class AckermannOdom(Node):
             right_fresh
         ):
 
-            wheel_trust = (
-                self.compute_wheel_trust(
-                    accel
-                )
-            )
-
-            correction_gain = (
-                self.wheel_correction_gain
-                *
-                wheel_trust
-            )
-
-            fused_speed = (
+            wheel_innovation = (
+                wheel_speed
+                -
                 predicted_speed
-                +
-                correction_gain
-                *
-                (
-                    wheel_speed
-                    -
-                    predicted_speed
-                )
             )
+
+            self.last_wheel_innovation = (
+                wheel_innovation
+            )
+
+            if accel <= self.positive_accel_threshold:
+
+                # Coast / steady / braking:
+                # wheel measurement is reliable and removes IMU drift fast.
+                wheel_trust = 1.0
+
+                fused_speed = (
+                    predicted_speed
+                    +
+                    self.wheel_correction_gain
+                    *
+                    wheel_innovation
+                )
+
+            else:
+
+                # Positive acceleration:
+                # determine correction authority from online spin estimate.
+                wheel_trust = (
+                    1.0 -
+                    spin_factor
+                )
+
+                accel_gain = (
+                    self.accel_wheel_gain_low_spin
+                    +
+                    spin_factor
+                    *
+                    (
+                        self.accel_wheel_gain_high_spin
+                        -
+                        self.accel_wheel_gain_low_spin
+                    )
+                )
+
+                step_cap = (
+                    self.accel_correction_step_low_spin
+                    +
+                    spin_factor
+                    *
+                    (
+                        self.accel_correction_step_high_spin
+                        -
+                        self.accel_correction_step_low_spin
+                    )
+                )
+
+                clipped_innovation = clamp(
+                    wheel_innovation,
+                    -self.negative_wheel_innovation_cap,
+                    self.positive_wheel_innovation_cap
+                )
+
+                requested_correction = (
+                    accel_gain
+                    *
+                    clipped_innovation
+                )
+
+                applied_correction = clamp(
+                    requested_correction,
+                    -step_cap,
+                    step_cap
+                )
+
+                fused_speed = (
+                    predicted_speed
+                    +
+                    applied_correction
+                )
+
+                self.last_accel_wheel_gain = (
+                    accel_gain
+                )
+
+                self.last_accel_correction = (
+                    applied_correction
+                )
 
         else:
 
             wheel_trust = 0.0
+            self.last_wheel_innovation = 0.0
             fused_speed = predicted_speed
 
         self.last_wheel_trust = (
             wheel_trust
         )
-
-        # ------------------------------------------------------------------
-        # V2 strong-acceleration safety floor
-        #
-        # Do NOT blend toward raw spinning-wheel speed.
-        #
-        # Only when positive acceleration is high, create a conservative
-        # lower-bound from wheel speed minus the measured high-acceleration
-        # slip margin.  If IMU integration has drifted below that floor,
-        # apply only a tiny bounded correction.
-        #
-        # Calibration basis from the recorded wheel-only run:
-        #     hard-acceleration wheel overspeed median ~2 m/s
-        #     large values >3 m/s were common
-        #
-        # Using 2.5 m/s therefore remains deliberately conservative.
-        # ------------------------------------------------------------------
-
-        self.accel_floor_active = False
-        self.last_accel_floor_correction = 0.0
-        self.last_accel_floor = 0.0
-
-        if (
-            left_fresh
-            and
-            right_fresh
-            and
-            accel >= self.accel_floor_activation
-        ):
-
-            wheel_floor = max(
-                0.0,
-                wheel_speed
-                -
-                self.accel_slip_margin
-            )
-
-            self.last_accel_floor = (
-                wheel_floor
-            )
-
-            if fused_speed < wheel_floor:
-
-                requested_correction = (
-                    self.accel_floor_alpha
-                    *
-                    (
-                        wheel_floor
-                        -
-                        fused_speed
-                    )
-                )
-
-                applied_correction = min(
-                    requested_correction,
-                    self.accel_floor_max_step
-                )
-
-                fused_speed += (
-                    applied_correction
-                )
-
-                self.last_accel_floor_correction = (
-                    applied_correction
-                )
-
-                self.accel_floor_active = True
 
         self.vehicle_speed = max(
             0.0,
@@ -1263,6 +1438,47 @@ class AckermannOdom(Node):
             self.odom_msg
         )
 
+        debug_msg = Float32()
+
+        debug_msg.data = float(
+            self.vehicle_speed
+        )
+        self.debug_hybrid_speed_pub.publish(
+            debug_msg
+        )
+
+        debug_msg = Float32()
+        debug_msg.data = float(
+            wheel_speed
+        )
+        self.debug_wheel_speed_pub.publish(
+            debug_msg
+        )
+
+        debug_msg = Float32()
+        debug_msg.data = float(
+            accel_for_prediction
+        )
+        self.debug_imu_accel_pub.publish(
+            debug_msg
+        )
+
+        debug_msg = Float32()
+        debug_msg.data = float(
+            self.last_wheel_innovation
+        )
+        self.debug_wheel_innovation_pub.publish(
+            debug_msg
+        )
+
+        debug_msg = Float32()
+        debug_msg.data = float(
+            self.last_spin_excess
+        )
+        self.debug_spin_excess_pub.publish(
+            debug_msg
+        )
+
     # ======================================================================
     # STATUS
     # ======================================================================
@@ -1271,17 +1487,16 @@ class AckermannOdom(Node):
         self
     ):
         self.get_logger().info(
-            "Ackermann-HYBRID-V2: "
+            "Ackermann-HYBRID-V3: "
             f"v={self.vehicle_speed:.2f} m/s, "
             f"wheel={self.last_wheel_speed:.2f}, "
             f"ax={self.last_accel_used:.2f}, "
-            f"wheel_trust={self.last_wheel_trust:.2f}, "
-            f"floor={self.last_accel_floor:.2f}, "
-            f"floor_dv={self.last_accel_floor_correction:.3f}, "
-            f"floor_active={self.accel_floor_active}, "
-            f"pose=({self.x:.2f}, "
-            f"{self.y:.2f}, "
-            f"{self.theta:.2f})"
+            f"wheel_accel={self.last_wheel_accel:.2f}, "
+            f"spin_excess={self.last_spin_excess:.2f}, "
+            f"spin_factor={self.last_spin_factor:.2f}, "
+            f"innovation={self.last_wheel_innovation:.2f}, "
+            f"accel_gain={self.last_accel_wheel_gain:.3f}, "
+            f"dv={self.last_accel_correction:.3f}"
         )
 
 
