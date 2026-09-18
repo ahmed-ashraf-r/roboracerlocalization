@@ -39,15 +39,18 @@ particle_filter:
     max_odom_yaw_rate: 20.0
 
     # ============================================================
-    # PARTICLES / RANGE LIBRARY
+    # RACING V2 PARTICLES / RANGE LIBRARY
+    # Goal: lower LiDAR->PF latency while retaining more rays than the
+    # original 2000/step12 configuration.
+    # 2500 particles + ~109 LiDAR rays/update.
     # ============================================================
-    max_particles: 2000
+    max_particles: 2500
     max_viz_particles: 60
-    angle_step: 12
+    angle_step: 10
 
     range_method: 'cddt'
     rangelib_variant: 2
-    theta_discretization: 112
+    theta_discretization: 160
     max_range: 10.0
     fine_timing: 0
 
@@ -55,29 +58,35 @@ particle_filter:
     # SENSOR MODEL
     # Keep baseline unchanged while validating high-speed deskew.
     # ============================================================
-    z_short: 0.01
+    z_short: 0.02
     z_max: 0.07
-    z_rand: 0.12
-    z_hit: 0.75
-    sigma_hit: 8.0
-    squash_factor: 2.2
+    z_rand: 0.09
+    z_hit: 0.82
+    sigma_hit: 7.0
+    squash_factor: 2.5
 
     # ============================================================
     # MOTION MODEL
     # These are motion-scaled coefficients in the corrected PF.
     # ============================================================
-    motion_dispersion_x: 0.005
-    motion_dispersion_y: 0.025
-    motion_dispersion_theta: 0.25
+    motion_dispersion_x: 0.006
+    motion_dispersion_y: 0.018
+    motion_dispersion_theta: 0.18
     motion_noise_floor_x: 0.0005
     motion_noise_floor_y: 0.0005
     motion_noise_floor_theta: 0.001
-    motion_noise_theta_distance_scale: 0.01
+    motion_noise_theta_distance_scale: 0.007
+
+    # Adaptive longitudinal diversity for corridor/high-dynamics sections.
+    # Extra sigma_long = min(cap, gain * |estimated acceleration|).
+    motion_noise_long_accel_gain: 0.010
+    motion_noise_long_accel_cap: 0.070
+    motion_accel_cap: 8.0
 
     # ============================================================
     # ESS RESAMPLING
     # ============================================================
-    ess_threshold_ratio: 0.50
+    ess_threshold_ratio: 0.45
 
     # ============================================================
     # KNOWN START POSE

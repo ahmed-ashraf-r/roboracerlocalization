@@ -53,25 +53,25 @@ class ParticleFiler(Node):
         # ------------------------------------------------------------------
         # Existing parameters (kept for compatibility with localize.yaml)
         # ------------------------------------------------------------------
-        self.declare_parameter('angle_step', 12)
-        self.declare_parameter('max_particles', 2000)
+        self.declare_parameter('angle_step', 10)
+        self.declare_parameter('max_particles', 2500)
         self.declare_parameter('max_viz_particles', 60)
-        self.declare_parameter('squash_factor', 2.2)
+        self.declare_parameter('squash_factor', 2.5)
         self.declare_parameter('max_range', 10.0)
-        self.declare_parameter('theta_discretization', 112)
+        self.declare_parameter('theta_discretization', 160)
         self.declare_parameter('range_method', 'cddt')
         self.declare_parameter('rangelib_variant', 2)
         self.declare_parameter('fine_timing', 0)
         self.declare_parameter('publish_odom', 1)
         self.declare_parameter('viz', 1)
-        self.declare_parameter('z_short', 0.01)
+        self.declare_parameter('z_short', 0.02)
         self.declare_parameter('z_max', 0.07)
-        self.declare_parameter('z_rand', 0.12)
-        self.declare_parameter('z_hit', 0.75)
-        self.declare_parameter('sigma_hit', 8.0)
-        self.declare_parameter('motion_dispersion_x', 0.005)
-        self.declare_parameter('motion_dispersion_y', 0.025)
-        self.declare_parameter('motion_dispersion_theta', 0.25)
+        self.declare_parameter('z_rand', 0.09)
+        self.declare_parameter('z_hit', 0.82)
+        self.declare_parameter('sigma_hit', 7.0)
+        self.declare_parameter('motion_dispersion_x', 0.006)
+        self.declare_parameter('motion_dispersion_y', 0.018)
+        self.declare_parameter('motion_dispersion_theta', 0.18)
         self.declare_parameter('scan_topic', '/autodrive/roboracer_1/lidar')
         self.declare_parameter('odometry_topic', '/odometry/filtered')
 
@@ -99,14 +99,36 @@ class ParticleFiler(Node):
         self.declare_parameter('initial_std_y', 0.02)
         self.declare_parameter('initial_std_yaw', math.radians(1.0))
         self.declare_parameter('initialpose_use_message_covariance', False)
-        self.declare_parameter('ess_threshold_ratio', 0.50)
+        self.declare_parameter('ess_threshold_ratio', 0.45)
         self.declare_parameter('publish_pf_tf', False)
 
         # motion_dispersion_* are now SCALE factors, not fixed noise per update.
         self.declare_parameter('motion_noise_floor_x', 0.0005)
         self.declare_parameter('motion_noise_floor_y', 0.0005)
         self.declare_parameter('motion_noise_floor_theta', 0.0010)
-        self.declare_parameter('motion_noise_theta_distance_scale', 0.01)
+        self.declare_parameter('motion_noise_theta_distance_scale', 0.007)
+
+        # ------------------------------------------------------------------
+        # Racing V2: adaptive longitudinal diversity
+        #
+        # The corridor is weakly observable along its length.  A tiny fixed
+        # longitudinal sigma lets the cloud become confidently wrong when the
+        # motion prior is biased during acceleration/deceleration.
+        #
+        # Estimate acceleration from successive synchronized odometry actions
+        # and temporarily increase ONLY longitudinal particle spread.
+        #
+        # Example:
+        #   accel = 0 m/s^2   -> no extra spread
+        #   accel = 3 m/s^2   -> +0.030 m sigma
+        #   accel = 6 m/s^2   -> +0.060 m sigma
+        #
+        # Lateral/yaw noise remain small so the corridor walls still constrain
+        # the car cleanly.
+        # ------------------------------------------------------------------
+        self.declare_parameter('motion_noise_long_accel_gain', 0.010)
+        self.declare_parameter('motion_noise_long_accel_cap', 0.070)
+        self.declare_parameter('motion_accel_cap', 8.0)
 
         # ------------------------------------------------------------------
         # High-speed synchronization / LiDAR deskew
@@ -155,6 +177,16 @@ class ParticleFiler(Node):
         self.MOTION_NOISE_FLOOR_THETA = float(self.get_parameter('motion_noise_floor_theta').value)
         self.MOTION_NOISE_THETA_DISTANCE_SCALE = float(
             self.get_parameter('motion_noise_theta_distance_scale').value
+        )
+
+        self.MOTION_NOISE_LONG_ACCEL_GAIN = float(
+            self.get_parameter('motion_noise_long_accel_gain').value
+        )
+        self.MOTION_NOISE_LONG_ACCEL_CAP = float(
+            self.get_parameter('motion_noise_long_accel_cap').value
+        )
+        self.MOTION_ACCEL_CAP = float(
+            self.get_parameter('motion_accel_cap').value
         )
 
         self.ENABLE_LIDAR_DESKEW = bool(
@@ -246,6 +278,12 @@ class ParticleFiler(Node):
         self.latest_odom_pose = None
         self.last_update_odom_pose = None
         self.last_update_odom_ns = None
+
+        # Racing V2 motion-uncertainty state.
+        self.last_motion_speed = None
+        self.current_motion_accel = 0.0
+        self.current_motion_dt = 0.0
+
         self.current_speed = 0.0
         self.current_wz = 0.0
         self.current_twist_covariance = [0.0] * 36
@@ -341,7 +379,7 @@ class ParticleFiler(Node):
 
         self.get_logger().info(
             'High-speed PF ready: synchronized EKF history, scan-midpoint motion, '
-            f'LiDAR deskew={self.ENABLE_LIDAR_DESKEW}, ESS-gated resampling enabled.'
+            f'LiDAR deskew={self.ENABLE_LIDAR_DESKEW}, ESS-gated resampling enabled, racing_v2=N{self.MAX_PARTICLES}/step{self.ANGLE_STEP}/theta{self.THETA_DISCRETIZATION}.'
         )
 
     # ======================================================================
@@ -956,6 +994,9 @@ class ParticleFiler(Node):
         if self.last_update_odom_pose is None or self.last_update_odom_ns is None:
             self.last_update_odom_pose = current_pose.copy()
             self.last_update_odom_ns = current_ns
+            self.last_motion_speed = None
+            self.current_motion_accel = 0.0
+            self.current_motion_dt = 0.0
             return np.zeros(3, dtype=np.float64)
 
         previous = self.last_update_odom_pose
@@ -965,6 +1006,8 @@ class ParticleFiler(Node):
         if dt <= 0.0:
             self.last_update_odom_pose = current_pose.copy()
             self.last_update_odom_ns = current_ns
+            self.current_motion_accel = 0.0
+            self.current_motion_dt = 0.0
             return np.zeros(3, dtype=np.float64)
 
         dx_world = current_pose[0] - previous[0]
@@ -974,6 +1017,26 @@ class ParticleFiler(Node):
 
         implied_speed = distance / dt
         implied_yaw_rate = abs(dtheta) / dt
+
+        # Racing V2:
+        # estimate acceleration from synchronized scan-center odometry motion.
+        # This is used ONLY to set particle uncertainty, never to alter the
+        # deterministic odometry action.
+        if self.last_motion_speed is None:
+            motion_accel = 0.0
+        else:
+            motion_accel = abs(
+                implied_speed
+                -
+                self.last_motion_speed
+            ) / dt
+
+        self.current_motion_accel = min(
+            motion_accel,
+            self.MOTION_ACCEL_CAP
+        )
+        self.current_motion_dt = dt
+        self.last_motion_speed = implied_speed
 
         # Do not reject legitimate 0.5+ m inter-scan motion at maximum speed.
         # Reject only when both the absolute jump and implied rate are
@@ -995,6 +1058,9 @@ class ParticleFiler(Node):
             )
             self.last_update_odom_pose = current_pose.copy()
             self.last_update_odom_ns = current_ns
+            self.last_motion_speed = None
+            self.current_motion_accel = 0.0
+            self.current_motion_dt = 0.0
             return np.zeros(3, dtype=np.float64)
 
         c = math.cos(previous[2])
@@ -1022,7 +1088,27 @@ class ParticleFiler(Node):
         proposal_dist[:, :] += self.local_deltas
 
         # Existing motion_dispersion_* parameters now scale with real motion.
-        sigma_long = self.MOTION_NOISE_FLOOR_X + self.MOTION_DISPERSION_X * distance
+        base_sigma_long = (
+            self.MOTION_NOISE_FLOOR_X
+            +
+            self.MOTION_DISPERSION_X
+            *
+            distance
+        )
+
+        adaptive_long_sigma = min(
+            self.MOTION_NOISE_LONG_ACCEL_CAP,
+            self.MOTION_NOISE_LONG_ACCEL_GAIN
+            *
+            self.current_motion_accel
+        )
+
+        sigma_long = (
+            base_sigma_long
+            +
+            adaptive_long_sigma
+        )
+
         sigma_lat = self.MOTION_NOISE_FLOOR_Y + self.MOTION_DISPERSION_Y * distance
         sigma_yaw = (
             self.MOTION_NOISE_FLOOR_THETA

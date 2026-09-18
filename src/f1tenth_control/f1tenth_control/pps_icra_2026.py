@@ -47,10 +47,36 @@ from std_msgs.msg import Float32
 # /localization/odom and EKF are both ~50 Hz, so run control at 50 Hz.
 CONTROL_PERIOD = 0.020          # [s] = 50 Hz
 
-# Proven baseline after Global Odom Fuser V2.
-# Keep 1.50 for the first latency-compensation validation.
-# After several clean laps, the next planned test is 1.30.
-VELOCITY_DIVISOR = 1.50
+# --------------------------------------------------------------------------
+# Curvature-dependent racing speed scaling
+#
+# 1.30 remains the FAST divisor used on straights and gentle curves.
+#
+# The latest 1.3 rosbag showed that the failure is concentrated in the
+# highest-curvature bottom hairpin.  The globally stable 1.50 setup already
+# proved that this corner can be completed repeatedly.
+#
+# Therefore:
+#   low curvature  -> divisor 1.30
+#   high curvature -> smoothly approach divisor 1.50
+#
+# This preserves most of the 1.3 lap-time gain instead of slowing the whole
+# circuit back to 1.5.
+# --------------------------------------------------------------------------
+
+VELOCITY_DIVISOR = 1.30
+TIGHT_CORNER_DIVISOR = 1.50
+
+# Start adding tight-corner protection above this curvature.
+CURVATURE_DIVISOR_START = 0.60    # [1/m]
+
+# At and above this curvature, use the full TIGHT_CORNER_DIVISOR.
+CURVATURE_DIVISOR_FULL = 1.40     # [1/m]
+
+# Use a very small local curvature window (~5 waypoints total) so an isolated
+# geometric spike cannot be missed, without turning this into a long minimum-
+# speed preview window.
+CURVATURE_SPEED_HALF_WINDOW = 2
 
 # Measured simulator feedforward relation.
 K_FF = 0.04131
@@ -64,17 +90,65 @@ STEER_LOOKAHEAD_GAIN = 0.45
 STEER_LOOKAHEAD_MIN = 0.70
 STEER_LOOKAHEAD_MAX = 2.00
 
+# --------------------------------------------------------------------------
+# Turn-in gate
+#
+# The latest bag showed strong steering starting ~1.2 m before the racing
+# line reaches kappa >= 0.20 1/m.  This gate prevents the Pure Pursuit target
+# from looking around a sharp corner too early.
+# --------------------------------------------------------------------------
+TURN_IN_CURVATURE_THRESHOLD = 0.20   # [1/m]
+TURN_IN_SEARCH_DISTANCE = 3.00       # [m]
+TURN_IN_START_DISTANCE = 0.70        # [m]
+TURN_IN_BEFORE_MARGIN = 0.05         # [m]
+TURN_IN_MAX_INSIDE = 0.55            # [m]
+
+# Fixed time prediction grows too large at racing speed.
+# Keep the measured time model, but cap how far forward steering may predict.
+MAX_STEERING_PREDICTION_DISTANCE = 0.35  # [m]
+
+# Upcoming curvature is kept for diagnostics only.
+#
+# IMPORTANT:
+# The previous 1.60 m curvature-based steering cap made the controller use a
+# ~0.75 m lookahead while the car was still on the straight before the
+# hairpin.  That changed the proven turn-in geometry and produced an abrupt
+# rotation.
+#
+# Steering is now back to the stable speed-based Pure Pursuit lookahead.
+STEER_CURVATURE_PREVIEW = 1.60     # [m], diagnostic only
+
 # Measured steering actuator delay from rosbag analysis was about 0.12 s.
 # Start with 0.10 s compensation so we anticipate the actuator without
 # over-predicting the vehicle motion.
-STEERING_LATENCY_COMP = 0.10   # [s]
+STEERING_LATENCY_COMP = 0.115  # [s]
 
-# Dynamic speed preview.
-# ~1.43 m at 5.8 m/s and ~1.98 m at 8.3 m/s.
-SPEED_PREVIEW_BASE = 0.15       # [m]
-SPEED_PREVIEW_TIME = 0.22       # [s]
-SPEED_PREVIEW_MIN = 0.35        # [m]
-SPEED_PREVIEW_MAX = 2.05        # [m]
+# --------------------------------------------------------------------------
+# Asymmetric speed-profile preview
+#
+# The latest 1.3 bag showed that using the full ~0.42 s longitudinal lag for
+# DECELERATION moves the low-speed hairpin target much too far upstream.
+# That causes the car to slow before the actual turn-in point.
+#
+# The old 0.22 s preview was already proven over many clean 1.5 laps, so use
+# that when the upcoming CSV profile is getting slower.
+#
+# Keep the longer 0.42 s preview only while the CSV profile is accelerating;
+# this brings throttle back early on corner exit and preserves lap time.
+# --------------------------------------------------------------------------
+
+SPEED_PREVIEW_BASE = 0.15             # [m]
+SPEED_PREVIEW_MIN = 0.35              # [m]
+
+SPEED_DECEL_PREVIEW_TIME = 0.22       # [s] proven stable turn-in timing
+SPEED_DECEL_PREVIEW_MAX = 2.20        # [m]
+
+SPEED_ACCEL_PREVIEW_TIME = 0.42       # [s] compensate acceleration lag
+SPEED_ACCEL_PREVIEW_MAX = 3.30        # [m]
+
+# Small deadband when deciding whether the local CSV profile is accelerating
+# or decelerating.
+SPEED_TREND_EPS = 0.05                # [m/s]
 
 # Offset-lookahead tuning.
 ALPHA_MAX = 0.05
@@ -651,6 +725,103 @@ def find_steering_lookahead_index(
 
 
 # ==========================================================================
+# UPCOMING PATH CURVATURE
+# ==========================================================================
+
+def max_curvature_ahead(
+    start_idx,
+    preview_distance
+):
+    """
+    Return the maximum absolute path curvature over the next
+    preview_distance metres along the CSV racing line.
+
+    This is used ONLY to adapt steering lookahead.  It does not change
+    throttle or the CSV velocity profile.
+    """
+
+    idx = int(start_idx) % path_len
+    travelled = 0.0
+    max_kappa = float(
+        abs(path_curvature[idx])
+    )
+
+    for _ in range(path_len):
+
+        if travelled >= preview_distance:
+            break
+
+        next_idx = (
+            idx + 1
+        ) % path_len
+
+        travelled += float(
+            np.linalg.norm(
+                goal[next_idx] -
+                goal[idx]
+            )
+        )
+
+        idx = next_idx
+
+        kappa = float(
+            abs(
+                path_curvature[idx]
+            )
+        )
+
+        if kappa > max_kappa:
+            max_kappa = kappa
+
+    return max_kappa
+
+
+# ==========================================================================
+# TURN-IN GEOMETRY
+# ==========================================================================
+
+def distance_to_upcoming_turn(
+    start_idx,
+    curvature_threshold,
+    max_search_distance
+):
+    """
+    Return arc distance from start_idx to the first waypoint whose path
+    curvature reaches curvature_threshold.
+
+    None is returned if no such point exists within max_search_distance.
+    """
+
+    idx = int(start_idx) % path_len
+    travelled = 0.0
+
+    for _ in range(path_len):
+
+        if abs(
+            path_curvature[idx]
+        ) >= curvature_threshold:
+            return travelled
+
+        next_idx = (
+            idx + 1
+        ) % path_len
+
+        travelled += float(
+            np.linalg.norm(
+                goal[next_idx] -
+                goal[idx]
+            )
+        )
+
+        if travelled > max_search_distance:
+            return None
+
+        idx = next_idx
+
+    return None
+
+
+# ==========================================================================
 # STEERING LATENCY COMPENSATION
 # ==========================================================================
 
@@ -677,6 +848,16 @@ def predict_control_pose(
         return (
             position.copy(),
             yaw
+        )
+
+    # Pure time compensation becomes too aggressive at high speed.
+    # Cap the geometric prediction distance while retaining the measured
+    # actuator-delay model at lower speeds.
+    if abs(speed) > 1e-6:
+        prediction_time = min(
+            prediction_time,
+            MAX_STEERING_PREDICTION_DISTANCE /
+            abs(speed)
         )
 
     # Nearly straight motion.
@@ -934,6 +1115,85 @@ def compute_offset_lookahead(
 
 
 # ==========================================================================
+# CURVATURE-DEPENDENT SPEED SCALING
+# ==========================================================================
+
+def speed_curvature_at_index(
+    index
+):
+    """
+    Return a robust local absolute curvature around the requested CSV index.
+
+    Only a tiny +/- waypoint window is used.  This avoids a one-point curvature
+    miss while still keeping speed control local and fast.
+    """
+
+    idx = int(index) % path_len
+
+    maximum_curvature = 0.0
+
+    for offset in range(
+        -CURVATURE_SPEED_HALF_WINDOW,
+        CURVATURE_SPEED_HALF_WINDOW + 1
+    ):
+
+        kappa = float(
+            abs(
+                path_curvature[
+                    (idx + offset) % path_len
+                ]
+            )
+        )
+
+        if kappa > maximum_curvature:
+            maximum_curvature = kappa
+
+    return maximum_curvature
+
+
+def curvature_speed_divisor(
+    curvature
+):
+    """
+    Smoothly blend between the fast 1.30 divisor and the proven-safe
+    tight-corner 1.50 divisor.
+
+    curvature <= 0.60  -> 1.30
+    curvature >= 1.40  -> 1.50
+    values between     -> linear blend
+    """
+
+    denominator = (
+        CURVATURE_DIVISOR_FULL -
+        CURVATURE_DIVISOR_START
+    )
+
+    if denominator <= 1e-9:
+        return TIGHT_CORNER_DIVISOR
+
+    factor = float(
+        np.clip(
+            (
+                curvature -
+                CURVATURE_DIVISOR_START
+            ) /
+            denominator,
+            0.0,
+            1.0
+        )
+    )
+
+    return float(
+        VELOCITY_DIVISOR +
+        factor *
+        (
+            TIGHT_CORNER_DIVISOR -
+            VELOCITY_DIVISOR
+        )
+    )
+
+
+# ==========================================================================
 # FEEDFORWARD THROTTLE
 # ==========================================================================
 
@@ -1120,13 +1380,83 @@ def timer_func(
         nearest_path_idx
     )
 
-    steering_lookahead = float(
+    # ----------------------------------------------------------------------
+    # Proven speed-based Pure Pursuit steering lookahead.
+    #
+    # Do NOT shorten the lookahead simply because a high-curvature point is
+    # visible 1.6 m ahead.  The latest bag showed that this activated the
+    # hairpin steering behavior before the vehicle reached the actual turn-in
+    # region.
+    # ----------------------------------------------------------------------
+
+    base_steering_lookahead = float(
         np.clip(
             STEER_LOOKAHEAD_GAIN *
             control_speed,
             STEER_LOOKAHEAD_MIN,
             STEER_LOOKAHEAD_MAX
         )
+    )
+
+    # Distance from the PREDICTED steering pose to the first genuinely
+    # sharp part of the racing line.
+    turn_distance = distance_to_upcoming_turn(
+        steering_nearest_idx,
+        TURN_IN_CURVATURE_THRESHOLD,
+        TURN_IN_SEARCH_DISTANCE
+    )
+
+    steering_lookahead = base_steering_lookahead
+
+    if turn_distance is not None:
+
+        if turn_distance > TURN_IN_START_DISTANCE:
+
+            # Keep the target just BEFORE the strong-curvature region.
+            # This prevents the 2.0 m lookahead from seeing around the
+            # hairpin while the car is still on the straight.
+            turn_cap = max(
+                STEER_LOOKAHEAD_MIN,
+                turn_distance -
+                TURN_IN_BEFORE_MARGIN
+            )
+
+        else:
+
+            # Once the car reaches the true turn-in zone, progressively let
+            # the target move inside the corner.
+            progress = float(
+                np.clip(
+                    (
+                        TURN_IN_START_DISTANCE -
+                        turn_distance
+                    ) /
+                    TURN_IN_START_DISTANCE,
+                    0.0,
+                    1.0
+                )
+            )
+
+            allowed_inside = (
+                TURN_IN_MAX_INSIDE *
+                progress
+            )
+
+            turn_cap = max(
+                STEER_LOOKAHEAD_MIN,
+                turn_distance +
+                allowed_inside
+            )
+
+        steering_lookahead = min(
+            steering_lookahead,
+            turn_cap
+        )
+
+    # Diagnostic only.
+    upcoming_curvature = max_curvature_ahead(
+        steering_nearest_idx,
+        STEER_CURVATURE_PREVIEW
     )
 
     lookahead_idx = find_steering_lookahead_index(
@@ -1173,27 +1503,136 @@ def timer_func(
     # It is NOT used as throttle feedback.
     # ----------------------------------------------------------------------
 
-    speed_preview_distance = float(
+    # ----------------------------------------------------------------------
+    # Asymmetric CSV speed preview.
+    #
+    # DECELERATION:
+    #   use the proven 0.22 s preview so the vehicle reaches the intended
+    #   turn-in region before the low hairpin speed is commanded.
+    #
+    # ACCELERATION:
+    #   use 0.42 s preview so feedforward throttle returns early on exit.
+    #
+    # We compare both future candidates with the local CSV target.  A slower
+    # deceleration candidate always has priority over acceleration.
+    # ----------------------------------------------------------------------
+
+    current_speed_curvature = speed_curvature_at_index(
+        nearest_path_idx
+    )
+
+    current_velocity_divisor = curvature_speed_divisor(
+        current_speed_curvature
+    )
+
+    current_profile_velocity = float(
+        vel_profile[
+            nearest_path_idx
+        ] /
+        current_velocity_divisor
+    )
+
+
+    decel_preview_distance = float(
         np.clip(
             SPEED_PREVIEW_BASE +
-            SPEED_PREVIEW_TIME *
+            SPEED_DECEL_PREVIEW_TIME *
             control_speed,
             SPEED_PREVIEW_MIN,
-            SPEED_PREVIEW_MAX
+            SPEED_DECEL_PREVIEW_MAX
         )
     )
 
-    speed_idx = advance_path_index_by_distance(
+    decel_idx = advance_path_index_by_distance(
         nearest_path_idx,
-        speed_preview_distance
+        decel_preview_distance
     )
 
-    target_velocity = float(
-        vel_profile[
-            speed_idx
-        ] /
-        VELOCITY_DIVISOR
+    decel_curvature = speed_curvature_at_index(
+        decel_idx
     )
+
+    decel_divisor = curvature_speed_divisor(
+        decel_curvature
+    )
+
+    decel_target_velocity = float(
+        vel_profile[
+            decel_idx
+        ] /
+        decel_divisor
+    )
+
+
+    accel_preview_distance = float(
+        np.clip(
+            SPEED_PREVIEW_BASE +
+            SPEED_ACCEL_PREVIEW_TIME *
+            control_speed,
+            SPEED_PREVIEW_MIN,
+            SPEED_ACCEL_PREVIEW_MAX
+        )
+    )
+
+    accel_idx = advance_path_index_by_distance(
+        nearest_path_idx,
+        accel_preview_distance
+    )
+
+    accel_curvature = speed_curvature_at_index(
+        accel_idx
+    )
+
+    accel_divisor = curvature_speed_divisor(
+        accel_curvature
+    )
+
+    accel_target_velocity = float(
+        vel_profile[
+            accel_idx
+        ] /
+        accel_divisor
+    )
+
+
+    # Approaching a slower section: brake/decelerate with the SHORT preview.
+    if (
+        decel_target_velocity <
+        current_profile_velocity -
+        SPEED_TREND_EPS
+    ):
+
+        speed_mode = 'DECEL'
+        speed_idx = decel_idx
+        speed_preview_distance = decel_preview_distance
+        speed_path_curvature = decel_curvature
+        effective_velocity_divisor = decel_divisor
+        target_velocity = decel_target_velocity
+
+    # Profile is opening up: use the LONG preview to restore throttle early.
+    elif (
+        accel_target_velocity >
+        current_profile_velocity +
+        SPEED_TREND_EPS
+    ):
+
+        speed_mode = 'ACCEL'
+        speed_idx = accel_idx
+        speed_preview_distance = accel_preview_distance
+        speed_path_curvature = accel_curvature
+        effective_velocity_divisor = accel_divisor
+        target_velocity = accel_target_velocity
+
+    # Nearly flat profile: command the local CSV value.
+    else:
+
+        speed_mode = 'HOLD'
+        speed_idx = nearest_path_idx
+        speed_preview_distance = 0.0
+        speed_path_curvature = current_speed_curvature
+        effective_velocity_divisor = current_velocity_divisor
+        target_velocity = current_profile_velocity
+
 
     throttle_command = speed_control(
         target_velocity
@@ -1299,8 +1738,13 @@ def timer_func(
             f'throttle={throttle_command:.3f}, '
             f'steer={normalized_steering:.3f}, '
             f'steer_L={steering_lookahead:.2f} m, '
+            f'turn_D={turn_distance if turn_distance is not None else -1.0:.2f} m, '
+            f'kappa_ahead={upcoming_curvature:.2f}, '
+            f'speed_kappa={speed_path_curvature:.2f}, '
+            f'div={effective_velocity_divisor:.3f}, '
+            f'speed_mode={speed_mode}, '
             f'speed_preview={speed_preview_distance:.2f} m, '
-            f'latency_comp={STEERING_LATENCY_COMP:.2f} s, '
+            f'latency_comp={STEERING_LATENCY_COMP:.3f} s, '
             f'idx={nearest_path_idx}'
         )
 
@@ -1406,9 +1850,11 @@ def main(
     node.get_logger().info(
         'High-rate global localization controller started. '
         f'control={1.0 / CONTROL_PERIOD:.1f} Hz, '
-        f'velocity_divisor={VELOCITY_DIVISOR:.2f}, '
-        f'preview_max={SPEED_PREVIEW_MAX:.2f} m, '
-        f'steering_latency_comp={STEERING_LATENCY_COMP:.2f} s, '
+        f'straight_divisor={VELOCITY_DIVISOR:.2f}, '
+        f'tight_divisor={TIGHT_CORNER_DIVISOR:.2f}, '
+        f'decel_preview={SPEED_DECEL_PREVIEW_TIME:.2f} s, '
+        f'accel_preview={SPEED_ACCEL_PREVIEW_TIME:.2f} s, '
+        f'steering_latency_comp={STEERING_LATENCY_COMP:.3f} s, '
         f'plotting={ENABLE_PLOTTING}'
     )
 
