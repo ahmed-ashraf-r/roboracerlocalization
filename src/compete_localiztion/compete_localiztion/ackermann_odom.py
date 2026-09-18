@@ -103,7 +103,7 @@ class AckermannOdom(Node):
         # ODOM MESSAGE PRE-ALLOCATION
         # ============================================================
         self.odom_msg = Odometry()
-        self.odom_msg.header.frame_id = "world"
+        self.odom_msg.header.frame_id = "odom"
         self.odom_msg.child_frame_id = "roboracer_1"
 
         self.get_logger().info("Ackermann Odom started with Low-Pass Filter")
