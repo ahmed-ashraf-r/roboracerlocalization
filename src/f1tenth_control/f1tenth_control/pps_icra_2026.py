@@ -81,7 +81,7 @@ from std_msgs.msg import Float32, Int32
 CONTROL_PERIOD = 0.020          # 50 Hz
 
 # Fast/gentle sections.
-VELOCITY_DIVISOR = 1.00
+VELOCITY_DIVISOR = 1.1
 
 # Tight-corner protection remains at the already-proven safe level.
 TIGHT_CORNER_DIVISOR = 1.50
@@ -159,8 +159,36 @@ STEER_LOOKAHEAD_MAX = 2.00
 # reversal.
 #
 CURVATURE_SIGN_THRESHOLD = 0.04      # [1/m]
-DIRECTION_CHANGE_PREVIEW = 0.35      # [m] preview beyond sign reversal
-DIRECTION_CHANGE_SEARCH_EXTRA = 0.75 # [m]
+
+# -------------------------------------------------------------------------
+# V5.1 RESIDUAL STEERING-LATENCY LEAD
+# -------------------------------------------------------------------------
+#
+# Keep the repo V5 direction-change behavior as the baseline.
+#
+# The actuator delay measured in the latest bag is still ~0.11 s; it has NOT
+# grown after several laps.  At high speed, however, V5's translational pose
+# prediction is capped at 0.35 m:
+#
+#     full delay distance = speed * 0.115
+#
+# At 5 m/s:
+#     full delay distance ~= 0.575 m
+#     predicted distance  = 0.350 m
+#     residual            ~= 0.225 m
+#
+# We compensate only a SMALL fraction of that residual, and ONLY when a
+# curvature-sign reversal is already inside the steering lookahead.
+#
+# This advances the S-turn reversal by only ~5-8 cm at racing speed instead
+# of adding extra steering magnitude or stacking wall/heading/grip feedback.
+#
+DIRECTION_CHANGE_PREVIEW_BASE = 0.35      # [m]
+LATENCY_REVERSAL_LEAD_GAIN = 0.35
+LATENCY_REVERSAL_LEAD_MAX = 0.10          # [m]
+DIRECTION_CHANGE_PREVIEW_MAX = 0.45       # [m]
+
+DIRECTION_CHANGE_SEARCH_EXTRA = 0.75      # [m]
 
 # The uploaded bag shows ~0.11-0.13 s actuator lag in the sharp left corner.
 # Keep the desired command from outrunning the measured actuator by too much.
@@ -1548,7 +1576,7 @@ class RoboRacerController(Node):
         )
 
         self.get_logger().info(
-            'RoboRacer 100% LEGAL LEFT-CORNER-V5 controller started | '
+            'RoboRacer 100% REPO-BASE LATENCY-V5.1 controller started | '
             f'control={1.0 / CONTROL_PERIOD:.1f} Hz | '
             f'fast_div={VELOCITY_DIVISOR:.2f} | '
             f'tight_div={TIGHT_CORNER_DIVISOR:.2f} | '
@@ -2185,6 +2213,48 @@ class RoboRacerController(Node):
             base_steering_lookahead
         )
 
+        # --------------------------------------------------------------
+        # V5.1 RESIDUAL LATENCY COMPENSATION
+        #
+        # predict_control_pose() already compensates actuator latency, but
+        # translation is capped at MAX_STEERING_PREDICTION_DISTANCE.
+        #
+        # The residual distance is the part of speed*delay that was NOT
+        # represented by that bounded pose prediction.
+        #
+        # Use only 35% of that residual and cap it at 10 cm.  This is a
+        # phase-lead adjustment, NOT an increase in steering authority.
+        # --------------------------------------------------------------
+
+        full_latency_distance = (
+            abs(
+                current_speed
+            )
+            *
+            STEERING_LATENCY_COMP
+        )
+
+        residual_latency_distance = max(
+            0.0,
+            full_latency_distance
+            -
+            prediction_distance
+        )
+
+        latency_reversal_lead = min(
+            LATENCY_REVERSAL_LEAD_MAX,
+            LATENCY_REVERSAL_LEAD_GAIN
+            *
+            residual_latency_distance
+        )
+
+        direction_change_preview = min(
+            DIRECTION_CHANGE_PREVIEW_MAX,
+            DIRECTION_CHANGE_PREVIEW_BASE
+            +
+            latency_reversal_lead
+        )
+
         if (
             direction_change_distance is not None
             and
@@ -2199,7 +2269,7 @@ class RoboRacerController(Node):
                     base_steering_lookahead,
                     direction_change_distance
                     +
-                    DIRECTION_CHANGE_PREVIEW
+                    direction_change_preview
                 )
             )
 
@@ -2715,6 +2785,8 @@ class RoboRacerController(Node):
                 f'L={steering_lookahead:.2f}/'
                 f'{base_steering_lookahead:.2f} m | '
                 f'dirchg={direction_change_active} | '
+                f'dir_prev={direction_change_preview:.2f} m | '
+                f'lat_res={residual_latency_distance:.2f} m | '
                 f'pred={prediction_distance:.2f}/{prediction_distance_cap:.2f} m | '
                 f'inside={inside_error:.3f} m | '
                 f'guard={cut_guard_blend:.2f} | '
