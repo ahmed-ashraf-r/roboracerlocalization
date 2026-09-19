@@ -2,6 +2,7 @@
 
 import math
 import time
+import traceback
 from collections import deque
 from threading import Lock
 
@@ -54,9 +55,9 @@ class ParticleFiler(Node):
         # Existing parameters (kept for compatibility with localize.yaml)
         # ------------------------------------------------------------------
         self.declare_parameter('angle_step', 10)
-        self.declare_parameter('max_particles', 2500)
+        self.declare_parameter('max_particles', 2000)
         self.declare_parameter('max_viz_particles', 60)
-        self.declare_parameter('squash_factor', 2.5)
+        self.declare_parameter('squash_factor', 2.0)
         self.declare_parameter('max_range', 10.0)
         self.declare_parameter('theta_discretization', 160)
         self.declare_parameter('range_method', 'cddt')
@@ -68,7 +69,7 @@ class ParticleFiler(Node):
         self.declare_parameter('z_max', 0.07)
         self.declare_parameter('z_rand', 0.09)
         self.declare_parameter('z_hit', 0.82)
-        self.declare_parameter('sigma_hit', 7.0)
+        self.declare_parameter('sigma_hit', 6.0)
         self.declare_parameter('motion_dispersion_x', 0.006)
         self.declare_parameter('motion_dispersion_y', 0.018)
         self.declare_parameter('motion_dispersion_theta', 0.18)
@@ -99,7 +100,7 @@ class ParticleFiler(Node):
         self.declare_parameter('initial_std_y', 0.02)
         self.declare_parameter('initial_std_yaw', math.radians(1.0))
         self.declare_parameter('initialpose_use_message_covariance', False)
-        self.declare_parameter('ess_threshold_ratio', 0.45)
+        self.declare_parameter('ess_threshold_ratio', 0.35)
         self.declare_parameter('publish_pf_tf', False)
 
         # motion_dispersion_* are now SCALE factors, not fixed noise per update.
@@ -134,10 +135,80 @@ class ParticleFiler(Node):
         # hypotheses alive in the long corridor during high-speed acceleration.
         # Only a few percent of particles are affected, and only along the
         # vehicle longitudinal axis.
-        self.declare_parameter('recovery_tail_ratio', 0.03)
+        self.declare_parameter('recovery_tail_ratio', 0.0)
         self.declare_parameter('recovery_tail_sigma', 0.22)
         self.declare_parameter('recovery_tail_accel_threshold', 1.50)
         self.declare_parameter('recovery_tail_speed_threshold', 4.50)
+
+        # ------------------------------------------------------------------
+        # Racing V4: forward-information LiDAR sampling
+        #
+        # Current V3 uses uniform every-Nth-ray sampling.  In a corridor, most
+        # side-wall rays constrain lateral position/yaw but provide very little
+        # information about progress ALONG the corridor.
+        #
+        # V4 keeps about the same total ray count while sampling the forward
+        # +/-60 degree sector much more densely:
+        #
+        #   front:  every 6th physical beam  (~1.5 deg)
+        #   sides:  every 20th beam           (~5.0 deg)
+        #
+        # This gives the end wall / next corner much more influence without
+        # increasing the RangeLib workload.
+        # ------------------------------------------------------------------
+        self.declare_parameter('front_ray_angle_deg', 60.0)
+        self.declare_parameter('front_ray_step', 6)
+        self.declare_parameter('side_ray_step', 20)
+
+        # ------------------------------------------------------------------
+        # Racing V4: deterministic longitudinal recovery bank
+        #
+        # At 100% speed the bag shows the EKF prior can become ~3-4 m short
+        # during the first acceleration.  V3's 3% / 0.22-m random tail cannot
+        # cover that error; the true pose leaves the entire cloud.
+        #
+        # While travelling fast and nearly straight, reserve a small controlled
+        # fraction of the cloud for longitudinal hypotheses spanning several
+        # metres.  Their total prior probability remains small, so the primary
+        # posterior stays smooth.  When the end wall/corner becomes visible,
+        # LiDAR can immediately select the correct longitudinal hypothesis.
+        # ------------------------------------------------------------------
+        self.declare_parameter('recovery_bank_ratio', 0.15)
+        self.declare_parameter('recovery_bank_weight', 0.10)
+        self.declare_parameter('recovery_bank_half_span', 4.0)
+        self.declare_parameter('recovery_bank_min_speed', 4.5)
+        # recovery_bank_max_abs_wz is declared in the V5 safety block below.
+        self.declare_parameter('recovery_bank_lateral_sigma', 0.03)
+        self.declare_parameter('recovery_bank_yaw_sigma', 0.015)
+        self.declare_parameter('recovery_bank_accel_bias_threshold', 0.50)
+
+        # ------------------------------------------------------------------
+        # Racing V5: map-safe recovery bank / RangeLib protection
+        #
+        # V4 successfully solved the high-speed corridor ambiguity, but the
+        # +/-4 m bank can extend beyond the map near the top/bottom edges.
+        # RangeLib/CDDT must never receive an out-of-map sensor origin.
+        # ------------------------------------------------------------------
+
+        # Recovery bank is intended for TRUE straight/corridor motion.
+        # Require a tighter yaw-rate condition than V4.
+        self.declare_parameter('recovery_bank_max_abs_wz', 0.25)
+
+        # Do not activate the long-range bank immediately when yaw-rate merely
+        # crosses through zero while exiting one turn / entering another.
+        self.declare_parameter('recovery_bank_straight_hold_time', 0.10)
+
+        # Bank candidates must leave this much map margin for the LiDAR origin.
+        self.declare_parameter('recovery_bank_map_margin', 0.10)
+
+        # Reject recovery candidates whose BASE pose lies in occupied/unknown
+        # map cells.
+        self.declare_parameter('recovery_bank_require_free_space', True)
+
+        # Last-resort RangeLib guard for ALL particles, not only bank particles.
+        # Invalid sensor origins are moved to an in-bounds placeholder before
+        # the C++ call and then assigned near-zero likelihood.
+        self.declare_parameter('raycast_map_margin', 0.05)
 
         # ------------------------------------------------------------------
         # High-speed synchronization / LiDAR deskew
@@ -211,6 +282,54 @@ class ParticleFiler(Node):
             self.get_parameter('recovery_tail_speed_threshold').value
         )
 
+        self.FRONT_RAY_ANGLE_DEG = float(
+            self.get_parameter('front_ray_angle_deg').value
+        )
+        self.FRONT_RAY_STEP = int(
+            self.get_parameter('front_ray_step').value
+        )
+        self.SIDE_RAY_STEP = int(
+            self.get_parameter('side_ray_step').value
+        )
+
+        self.RECOVERY_BANK_RATIO = float(
+            self.get_parameter('recovery_bank_ratio').value
+        )
+        self.RECOVERY_BANK_WEIGHT = float(
+            self.get_parameter('recovery_bank_weight').value
+        )
+        self.RECOVERY_BANK_HALF_SPAN = float(
+            self.get_parameter('recovery_bank_half_span').value
+        )
+        self.RECOVERY_BANK_MIN_SPEED = float(
+            self.get_parameter('recovery_bank_min_speed').value
+        )
+        self.RECOVERY_BANK_MAX_ABS_WZ = float(
+            self.get_parameter('recovery_bank_max_abs_wz').value
+        )
+        self.RECOVERY_BANK_LATERAL_SIGMA = float(
+            self.get_parameter('recovery_bank_lateral_sigma').value
+        )
+        self.RECOVERY_BANK_YAW_SIGMA = float(
+            self.get_parameter('recovery_bank_yaw_sigma').value
+        )
+        self.RECOVERY_BANK_ACCEL_BIAS_THRESHOLD = float(
+            self.get_parameter('recovery_bank_accel_bias_threshold').value
+        )
+
+        self.RECOVERY_BANK_STRAIGHT_HOLD_TIME = float(
+            self.get_parameter('recovery_bank_straight_hold_time').value
+        )
+        self.RECOVERY_BANK_MAP_MARGIN = float(
+            self.get_parameter('recovery_bank_map_margin').value
+        )
+        self.RECOVERY_BANK_REQUIRE_FREE_SPACE = bool(
+            self.get_parameter('recovery_bank_require_free_space').value
+        )
+        self.RAYCAST_MAP_MARGIN = float(
+            self.get_parameter('raycast_map_margin').value
+        )
+
         self.ENABLE_LIDAR_DESKEW = bool(
             self.get_parameter('enable_lidar_deskew').value
         )
@@ -270,6 +389,27 @@ class ParticleFiler(Node):
         if self.MAX_ODOM_YAW_RATE <= 0.0:
             raise ValueError('max_odom_yaw_rate must be > 0')
 
+        if self.FRONT_RAY_STEP < 1:
+            raise ValueError('front_ray_step must be >= 1')
+
+        if self.SIDE_RAY_STEP < 1:
+            raise ValueError('side_ray_step must be >= 1')
+
+        if not 0.0 <= self.RECOVERY_BANK_RATIO < 1.0:
+            raise ValueError('recovery_bank_ratio must be in [0,1)')
+
+        if not 0.0 <= self.RECOVERY_BANK_WEIGHT < 1.0:
+            raise ValueError('recovery_bank_weight must be in [0,1)')
+
+        if self.RECOVERY_BANK_STRAIGHT_HOLD_TIME < 0.0:
+            raise ValueError('recovery_bank_straight_hold_time must be >= 0')
+
+        if self.RECOVERY_BANK_MAP_MARGIN < 0.0:
+            raise ValueError('recovery_bank_map_margin must be >= 0')
+
+        if self.RAYCAST_MAP_MARGIN < 0.0:
+            raise ValueError('raycast_map_margin must be >= 0')
+
         # ------------------------------------------------------------------
         # State
         # ------------------------------------------------------------------
@@ -304,8 +444,20 @@ class ParticleFiler(Node):
         # Racing V2 motion-uncertainty state.
         self.last_motion_speed = None
         self.current_motion_accel = 0.0
+        self.current_signed_motion_accel = 0.0
         self.current_motion_dt = 0.0
         self.last_recovery_tail_count = 0
+
+        # Racing V4 recovery-bank diagnostics.
+        self.last_recovery_bank_count = 0
+        self.last_recovery_bank_min_offset = 0.0
+        self.last_recovery_bank_max_offset = 0.0
+
+        # V5 recovery-bank safety state.
+        self.recovery_bank_straight_time = 0.0
+        self.last_recovery_bank_rejected_map = 0
+        self.last_invalid_raycast_count = 0
+        self.scan_processing_error_count = 0
 
         self.current_speed = 0.0
         self.current_wz = 0.0
@@ -402,7 +554,7 @@ class ParticleFiler(Node):
 
         self.get_logger().info(
             'High-speed PF ready: synchronized EKF history, scan-midpoint motion, '
-            f'LiDAR deskew={self.ENABLE_LIDAR_DESKEW}, ESS-gated resampling enabled, racing_v3=N{self.MAX_PARTICLES}/step{self.ANGLE_STEP}/theta{self.THETA_DISCRETIZATION}.'
+            f'LiDAR deskew={self.ENABLE_LIDAR_DESKEW}, ESS-gated resampling enabled, racing_v5=MAP_SAFE/N{self.MAX_PARTICLES}/front-heavy-rays/theta{self.THETA_DISCRETIZATION}.'
         )
 
     # ======================================================================
@@ -550,6 +702,295 @@ class ParticleFiler(Node):
             ],
             dtype=np.float32,
         )
+
+    # ======================================================================
+    # Racing V5 map / RangeLib safety helpers
+    # ======================================================================
+
+    def _world_to_map_xy(self, poses):
+        """
+        Vectorized world [m] -> map pixel coordinates without modifying input.
+
+        Returns:
+            map_x, map_y
+        """
+
+        origin_x = float(
+            self.map_info.origin.position.x
+        )
+
+        origin_y = float(
+            self.map_info.origin.position.y
+        )
+
+        resolution = float(
+            self.map_info.resolution
+        )
+
+        origin_yaw = float(
+            Utils.quaternion_to_angle(
+                self.map_info.origin.orientation
+            )
+        )
+
+        dx = (
+            poses[:, 0]
+            -
+            origin_x
+        )
+
+        dy = (
+            poses[:, 1]
+            -
+            origin_y
+        )
+
+        c = math.cos(
+            -origin_yaw
+        )
+
+        s = math.sin(
+            -origin_yaw
+        )
+
+        map_x = (
+            c * dx
+            -
+            s * dy
+        ) / resolution
+
+        map_y = (
+            s * dx
+            +
+            c * dy
+        ) / resolution
+
+        return (
+            map_x,
+            map_y
+        )
+
+    def _sensor_origins_inside_map(
+        self,
+        sensor_poses,
+        margin_m
+    ):
+        """
+        Boolean mask for sensor origins that are safely inside the occupancy
+        map rectangle.
+        """
+
+        map_x, map_y = self._world_to_map_xy(
+            sensor_poses
+        )
+
+        margin_px = (
+            float(
+                margin_m
+            )
+            /
+            float(
+                self.map_info.resolution
+            )
+        )
+
+        max_x = (
+            float(
+                self.map_info.width
+            )
+            -
+            1.0
+            -
+            margin_px
+        )
+
+        max_y = (
+            float(
+                self.map_info.height
+            )
+            -
+            1.0
+            -
+            margin_px
+        )
+
+        return (
+            (map_x >= margin_px)
+            &
+            (map_x <= max_x)
+            &
+            (map_y >= margin_px)
+            &
+            (map_y <= max_y)
+        )
+
+    def _base_poses_in_free_space(
+        self,
+        base_poses
+    ):
+        """
+        Check that base-pose XY falls in an in-bounds FREE occupancy cell.
+        """
+
+        map_x, map_y = self._world_to_map_xy(
+            base_poses
+        )
+
+        ix = np.floor(
+            map_x
+        ).astype(
+            np.int64
+        )
+
+        iy = np.floor(
+            map_y
+        ).astype(
+            np.int64
+        )
+
+        in_bounds = (
+            (ix >= 0)
+            &
+            (ix < int(self.map_info.width))
+            &
+            (iy >= 0)
+            &
+            (iy < int(self.map_info.height))
+        )
+
+        result = np.zeros(
+            len(base_poses),
+            dtype=bool
+        )
+
+        valid_indices = np.where(
+            in_bounds
+        )[0]
+
+        if valid_indices.size > 0:
+
+            result[
+                valid_indices
+            ] = self.permissible_region[
+                iy[
+                    valid_indices
+                ],
+                ix[
+                    valid_indices
+                ]
+            ]
+
+        return result
+
+    def _sanitize_sensor_poses_for_raycast(
+        self,
+        sensor_poses
+    ):
+        """
+        LAST-RESORT guard before calling RangeLib C++.
+
+        Any out-of-map sensor origin is moved to the nearest safe map boundary
+        location for ray casting.  Its particle likelihood is later forced to
+        ~zero, so this placeholder can never become a valid hypothesis.
+
+        This guarantees that RangeLib/CDDT never sees an unsafe origin even if
+        future motion/noise code accidentally creates one.
+        """
+
+        valid = self._sensor_origins_inside_map(
+            sensor_poses,
+            self.RAYCAST_MAP_MARGIN
+        )
+
+        invalid = ~valid
+
+        invalid_count = int(
+            np.count_nonzero(
+                invalid
+            )
+        )
+
+        self.last_invalid_raycast_count = (
+            invalid_count
+        )
+
+        if invalid_count == 0:
+
+            return invalid
+
+        # Convert invalid poses to map-pixel coordinates.
+        safe = np.asarray(
+            sensor_poses[
+                invalid
+            ],
+            dtype=np.float64
+        ).copy()
+
+        Utils.world_to_map(
+            safe,
+            self.map_info
+        )
+
+        margin_px = max(
+            1.0,
+            self.RAYCAST_MAP_MARGIN
+            /
+            float(
+                self.map_info.resolution
+            )
+        )
+
+        safe[
+            :,
+            0
+        ] = np.clip(
+            safe[
+                :,
+                0
+            ],
+            margin_px,
+            float(
+                self.map_info.width
+            )
+            -
+            1.0
+            -
+            margin_px
+        )
+
+        safe[
+            :,
+            1
+        ] = np.clip(
+            safe[
+                :,
+                1
+            ],
+            margin_px,
+            float(
+                self.map_info.height
+            )
+            -
+            1.0
+            -
+            margin_px
+        )
+
+        Utils.map_to_world(
+            safe,
+            self.map_info
+        )
+
+        sensor_poses[
+            invalid,
+            :
+        ] = safe[
+            :,
+            :
+        ]
+
+        return invalid
+
 
     # ======================================================================
     # High-speed odometry synchronization / LiDAR deskew helpers
@@ -762,15 +1203,31 @@ class ParticleFiler(Node):
                 self.get_logger().warn(f'Dropping LiDAR scan: {exc}')
                 continue
 
-            self.update_from_scan(
-                scan=scan,
-                ref_pose=ref_pose,
-                observation=ranges,
-                scan_angles=angles,
-                ref_vx=ref_vx,
-                ref_wz=ref_wz,
-                twist_covariance=twist_cov,
-            )
+            try:
+
+                self.update_from_scan(
+                    scan=scan,
+                    ref_pose=ref_pose,
+                    observation=ranges,
+                    scan_angles=angles,
+                    ref_vx=ref_vx,
+                    ref_wz=ref_wz,
+                    twist_covariance=twist_cov,
+                )
+
+            except Exception as exc:
+
+                # A malformed/numerically bad scan must not permanently kill
+                # global localization during a race.
+                self.scan_processing_error_count += 1
+
+                self.get_logger().error(
+                    'PF scan processing failed but node will continue: '
+                    f'{type(exc).__name__}: {exc}\n'
+                    f'{traceback.format_exc(limit=3)}'
+                )
+
+                continue
 
     # ======================================================================
     # ROS callbacks
@@ -827,14 +1284,63 @@ class ParticleFiler(Node):
             or len(self.laser_angles) != num_measurements
         ):
             self.get_logger().info('...Received first/new-shape LiDAR message')
-            self.selected_ray_indices = np.arange(
-                0, num_measurements, self.ANGLE_STEP, dtype=np.int64
-            )
             self.laser_angles = (
                 float(msg.angle_min)
                 + np.arange(num_measurements, dtype=np.float64)
                 * float(msg.angle_increment)
             )
+
+            front_limit = math.radians(
+                self.FRONT_RAY_ANGLE_DEG
+            )
+
+            front_indices = np.where(
+                np.abs(
+                    self.laser_angles
+                )
+                <=
+                front_limit
+            )[0]
+
+            side_indices = np.where(
+                np.abs(
+                    self.laser_angles
+                )
+                >
+                front_limit
+            )[0]
+
+            selected_front = front_indices[
+                ::self.FRONT_RAY_STEP
+            ]
+
+            selected_side = side_indices[
+                ::self.SIDE_RAY_STEP
+            ]
+
+            center_index = int(
+                np.argmin(
+                    np.abs(
+                        self.laser_angles
+                    )
+                )
+            )
+
+            self.selected_ray_indices = np.unique(
+                np.concatenate(
+                    (
+                        selected_front,
+                        selected_side,
+                        np.array(
+                            [center_index],
+                            dtype=np.int64
+                        )
+                    )
+                )
+            ).astype(
+                np.int64
+            )
+
             self.downsampled_angles = self.laser_angles[
                 self.selected_ray_indices
             ].astype(np.float32)
@@ -848,6 +1354,9 @@ class ParticleFiler(Node):
             self.get_logger().info(
                 f'LiDAR beams={num_measurements}, using '
                 f'{len(self.selected_ray_indices)} rays/update, '
+                f'front=+/-{self.FRONT_RAY_ANGLE_DEG:.0f}deg/'
+                f'step{self.FRONT_RAY_STEP}, '
+                f'side_step={self.SIDE_RAY_STEP}, '
                 f'deskew={self.ENABLE_LIDAR_DESKEW}'
             )
 
@@ -1019,6 +1528,7 @@ class ParticleFiler(Node):
             self.last_update_odom_ns = current_ns
             self.last_motion_speed = None
             self.current_motion_accel = 0.0
+            self.current_signed_motion_accel = 0.0
             self.current_motion_dt = 0.0
             return np.zeros(3, dtype=np.float64)
 
@@ -1030,6 +1540,7 @@ class ParticleFiler(Node):
             self.last_update_odom_pose = current_pose.copy()
             self.last_update_odom_ns = current_ns
             self.current_motion_accel = 0.0
+            self.current_signed_motion_accel = 0.0
             self.current_motion_dt = 0.0
             return np.zeros(3, dtype=np.float64)
 
@@ -1046,18 +1557,26 @@ class ParticleFiler(Node):
         # This is used ONLY to set particle uncertainty, never to alter the
         # deterministic odometry action.
         if self.last_motion_speed is None:
-            motion_accel = 0.0
+            signed_motion_accel = 0.0
         else:
-            motion_accel = abs(
+            signed_motion_accel = (
                 implied_speed
                 -
                 self.last_motion_speed
             ) / dt
 
-        self.current_motion_accel = min(
-            motion_accel,
-            self.MOTION_ACCEL_CAP
+        self.current_signed_motion_accel = float(
+            np.clip(
+                signed_motion_accel,
+                -self.MOTION_ACCEL_CAP,
+                self.MOTION_ACCEL_CAP
+            )
         )
+
+        self.current_motion_accel = abs(
+            self.current_signed_motion_accel
+        )
+
         self.current_motion_dt = dt
         self.last_motion_speed = implied_speed
 
@@ -1083,6 +1602,7 @@ class ParticleFiler(Node):
             self.last_update_odom_ns = current_ns
             self.last_motion_speed = None
             self.current_motion_accel = 0.0
+            self.current_signed_motion_accel = 0.0
             self.current_motion_dt = 0.0
             return np.zeros(3, dtype=np.float64)
 
@@ -1190,6 +1710,383 @@ class ParticleFiler(Node):
         proposal_dist[:, 2] = self._wrap_angle(proposal_dist[:, 2])
 
     # ======================================================================
+    # High-speed longitudinal recovery bank
+    # ======================================================================
+
+    def inject_longitudinal_recovery_bank(self):
+        """
+        Racing V5 long-range corridor recovery hypotheses.
+
+        V4 concept retained:
+          - small long-range longitudinal hypothesis bank
+          - biased forward during acceleration
+          - biased backward during deceleration
+
+        V5 safety additions:
+          - must remain straight for a short HOLD time;
+          - candidate BASE pose must be inside/free;
+          - candidate LIDAR origin must remain inside the map margin;
+          - total bank prior weight scales down if map boundaries reduce the
+            number of valid hypotheses.
+
+        No unsafe candidate is ever passed to RangeLib.
+        """
+
+        self.last_recovery_bank_count = 0
+        self.last_recovery_bank_min_offset = 0.0
+        self.last_recovery_bank_max_offset = 0.0
+        self.last_recovery_bank_rejected_map = 0
+
+        if (
+            self.RECOVERY_BANK_RATIO <= 0.0
+            or
+            self.RECOVERY_BANK_WEIGHT <= 0.0
+            or
+            self.RECOVERY_BANK_HALF_SPAN <= 0.0
+        ):
+
+            self.recovery_bank_straight_time = 0.0
+            return
+
+        # --------------------------------------------------------------
+        # Bank is only for sustained high-speed STRAIGHT motion.
+        # --------------------------------------------------------------
+
+        straight_now = (
+            self.current_speed
+            >=
+            self.RECOVERY_BANK_MIN_SPEED
+            and
+            abs(
+                self.current_wz
+            )
+            <=
+            self.RECOVERY_BANK_MAX_ABS_WZ
+        )
+
+        if straight_now:
+
+            self.recovery_bank_straight_time += max(
+                float(
+                    self.current_motion_dt
+                ),
+                0.0
+            )
+
+        else:
+
+            self.recovery_bank_straight_time = 0.0
+            return
+
+        if (
+            self.recovery_bank_straight_time
+            <
+            self.RECOVERY_BANK_STRAIGHT_HOLD_TIME
+        ):
+
+            return
+
+        desired_n = int(
+            round(
+                self.RECOVERY_BANK_RATIO
+                *
+                self.MAX_PARTICLES
+            )
+        )
+
+        desired_n = max(
+            1,
+            min(
+                desired_n,
+                self.MAX_PARTICLES - 1
+            )
+        )
+
+        center_pose = (
+            self.expected_pose()
+        )
+
+        center_yaw = float(
+            center_pose[2]
+        )
+
+        span = float(
+            self.RECOVERY_BANK_HALF_SPAN
+        )
+
+        # --------------------------------------------------------------
+        # Directional bias based on motion-prior acceleration error mode.
+        # --------------------------------------------------------------
+
+        if (
+            self.current_signed_motion_accel
+            >
+            self.RECOVERY_BANK_ACCEL_BIAS_THRESHOLD
+        ):
+
+            min_offset = (
+                -0.25
+                *
+                span
+            )
+
+            max_offset = (
+                span
+            )
+
+        elif (
+            self.current_signed_motion_accel
+            <
+            -self.RECOVERY_BANK_ACCEL_BIAS_THRESHOLD
+        ):
+
+            min_offset = (
+                -span
+            )
+
+            max_offset = (
+                0.25
+                *
+                span
+            )
+
+        else:
+
+            min_offset = (
+                -span
+            )
+
+            max_offset = (
+                span
+            )
+
+        offsets = np.linspace(
+            min_offset,
+            max_offset,
+            desired_n,
+            dtype=np.float64
+        )
+
+        np.random.shuffle(
+            offsets
+        )
+
+        lateral = np.random.normal(
+            0.0,
+            self.RECOVERY_BANK_LATERAL_SIGMA,
+            desired_n
+        )
+
+        yaw_noise = np.random.normal(
+            0.0,
+            self.RECOVERY_BANK_YAW_SIGMA,
+            desired_n
+        )
+
+        c = math.cos(
+            center_yaw
+        )
+
+        s = math.sin(
+            center_yaw
+        )
+
+        candidates = np.zeros(
+            (
+                desired_n,
+                3
+            ),
+            dtype=np.float64
+        )
+
+        candidates[
+            :,
+            0
+        ] = (
+            center_pose[0]
+            +
+            c
+            *
+            offsets
+            -
+            s
+            *
+            lateral
+        )
+
+        candidates[
+            :,
+            1
+        ] = (
+            center_pose[1]
+            +
+            s
+            *
+            offsets
+            +
+            c
+            *
+            lateral
+        )
+
+        candidates[
+            :,
+            2
+        ] = self._wrap_angle(
+            center_yaw
+            +
+            yaw_noise
+        )
+
+        candidate_sensor_poses = np.zeros_like(
+            candidates
+        )
+
+        self._base_to_lidar_poses(
+            candidates,
+            candidate_sensor_poses
+        )
+
+        valid = self._sensor_origins_inside_map(
+            candidate_sensor_poses,
+            self.RECOVERY_BANK_MAP_MARGIN
+        )
+
+        if self.RECOVERY_BANK_REQUIRE_FREE_SPACE:
+
+            valid &= self._base_poses_in_free_space(
+                candidates
+            )
+
+        valid_indices = np.where(
+            valid
+        )[0]
+
+        self.last_recovery_bank_rejected_map = int(
+            desired_n
+            -
+            valid_indices.size
+        )
+
+        if valid_indices.size == 0:
+
+            return
+
+        valid_candidates = candidates[
+            valid_indices
+        ]
+
+        valid_offsets = offsets[
+            valid_indices
+        ]
+
+        n_bank = int(
+            valid_candidates.shape[0]
+        )
+
+        # Re-purpose lowest-weight particles.
+        bank_indices = np.argpartition(
+            self.weights,
+            n_bank - 1
+        )[
+            :n_bank
+        ]
+
+        main_mask = np.ones(
+            self.MAX_PARTICLES,
+            dtype=bool
+        )
+
+        main_mask[
+            bank_indices
+        ] = False
+
+        self.particles[
+            bank_indices,
+            :
+        ] = valid_candidates[
+            :,
+            :
+        ]
+
+        # If map geometry removes some bank hypotheses, proportionally reduce
+        # total bank prior weight instead of concentrating the full 10% prior
+        # onto a small number of edge particles.
+        valid_fraction = (
+            float(
+                n_bank
+            )
+            /
+            float(
+                desired_n
+            )
+        )
+
+        effective_bank_weight = (
+            self.RECOVERY_BANK_WEIGHT
+            *
+            valid_fraction
+        )
+
+        main_sum = float(
+            np.sum(
+                self.weights[
+                    main_mask
+                ]
+            )
+        )
+
+        if main_sum > 1e-12:
+
+            self.weights[
+                main_mask
+            ] *= (
+                1.0
+                -
+                effective_bank_weight
+            ) / main_sum
+
+        else:
+
+            self.weights[
+                main_mask
+            ] = (
+                1.0
+                -
+                effective_bank_weight
+            ) / float(
+                np.count_nonzero(
+                    main_mask
+                )
+            )
+
+        self.weights[
+            bank_indices
+        ] = (
+            effective_bank_weight
+            /
+            float(
+                n_bank
+            )
+        )
+
+        self.last_recovery_bank_count = (
+            n_bank
+        )
+
+        self.last_recovery_bank_min_offset = float(
+            np.min(
+                valid_offsets
+            )
+        )
+
+        self.last_recovery_bank_max_offset = float(
+            np.max(
+                valid_offsets
+            )
+        )
+
+    # ======================================================================
     # Sensor model
     # ======================================================================
     def sensor_model(self, base_particles, obs, scan_angles, likelihoods):
@@ -1220,6 +2117,15 @@ class ParticleFiler(Node):
             self.tiled_angles[:] = np.tile(scan_angles, self.MAX_PARTICLES)
 
         self._base_to_lidar_poses(base_particles, self.sensor_poses)
+
+        # V5 hard guard:
+        # RangeLib/CDDT never receives an out-of-map LiDAR origin.
+        invalid_sensor_origins = (
+            self._sanitize_sensor_poses_for_raycast(
+                self.sensor_poses
+            )
+        )
+
         likelihoods.fill(1.0)
 
         if self.RANGELIB_VAR == VAR_RADIAL_CDDT_OPTIMIZATIONS:
@@ -1330,6 +2236,17 @@ class ParticleFiler(Node):
         else:
             raise ValueError('rangelib_variant must be 0..4')
 
+        # Any particle whose real LiDAR origin was outside the map used a
+        # temporary safe placeholder only to protect the C++ ray caster.
+        # It must never receive useful posterior probability.
+        if np.any(
+            invalid_sensor_origins
+        ):
+
+            likelihoods[
+                invalid_sensor_origins
+            ] = 1e-300
+
         # Avoid NaN/Inf/zero collapse before Bayesian multiplication.
         np.nan_to_num(likelihoods, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
         np.maximum(likelihoods, 1e-300, out=likelihoods)
@@ -1413,6 +2330,10 @@ class ParticleFiler(Node):
             # 1) Motion prediction from EKF pose at previous/current scan centers.
             self.motion_model(self.particles, action)
 
+            # 1b) Maintain long-range longitudinal hypotheses during fast,
+            # nearly-straight motion.  This is the key Racing V4 corridor fix.
+            self.inject_longitudinal_recovery_bank()
+
             # 2) One measurement likelihood for this physical scan.  The rays
             # have already been deskewed into the current scan-center frame.
             self.sensor_model(
@@ -1463,6 +2384,14 @@ class ParticleFiler(Node):
                 f'resampled={self.last_resampled}, '
                 f'accel={self.current_motion_accel:.2f}m/s2, '
                 f'recovery_tail={self.last_recovery_tail_count}, '
+                f'bank={self.last_recovery_bank_count}, '
+                f'bank_span=['
+                f'{self.last_recovery_bank_min_offset:.1f},'
+                f'{self.last_recovery_bank_max_offset:.1f}]m, '
+                f'bank_wait={self.recovery_bank_straight_time:.2f}s, '
+                f'bank_map_reject={self.last_recovery_bank_rejected_map}, '
+                f'raycast_invalid={self.last_invalid_raycast_count}, '
+                f'scan_errors={self.scan_processing_error_count}, '
                 f'deskew={self.ENABLE_LIDAR_DESKEW}, '
                 f'scan_span={scan_span_ms:.2f}ms, '
                 f'vx={self.current_speed:.2f}m/s, wz={self.current_wz:.2f}rad/s'

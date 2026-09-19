@@ -39,12 +39,12 @@ particle_filter:
     max_odom_yaw_rate: 20.0
 
     # ============================================================
-    # RACING V3 PARTICLES / RANGE LIBRARY
+    # RACING V5 MAP-SAFE CORRIDOR PARTICLES / RANGE LIBRARY
     # Goal: lower LiDAR->PF latency while retaining more rays than the
     # original 2000/step12 configuration.
     # 2500 particles + ~109 LiDAR rays/update.
     # ============================================================
-    max_particles: 2500
+    max_particles: 2000
     max_viz_particles: 60
     angle_step: 10
 
@@ -62,8 +62,8 @@ particle_filter:
     z_max: 0.07
     z_rand: 0.09
     z_hit: 0.82
-    sigma_hit: 7.0
-    squash_factor: 2.5
+    sigma_hit: 6.0
+    squash_factor: 2.0
 
     # ============================================================
     # MOTION MODEL
@@ -84,15 +84,66 @@ particle_filter:
     motion_accel_cap: 8.0
 
     # Sparse longitudinal recovery hypotheses for high-speed corridor runs.
-    recovery_tail_ratio: 0.03
+    recovery_tail_ratio: 0.0
     recovery_tail_sigma: 0.22
     recovery_tail_accel_threshold: 1.50
     recovery_tail_speed_threshold: 4.50
 
     # ============================================================
+    # RACING V4 FORWARD-INFORMATION RAY SELECTION
+    # ============================================================
+    # Approx. 111 rays/update on the 1081-beam LiDAR:
+    #   front +/-60 deg : every 6th beam (~1.5 deg)
+    #   side sectors    : every 20th beam (~5.0 deg)
+    #
+    # Similar/lower compute cost than V3 but much stronger sensitivity
+    # to the corridor end wall and upcoming corner.
+    front_ray_angle_deg: 60.0
+    front_ray_step: 6
+    side_ray_step: 20
+
+    # ============================================================
+    # RACING V4 LONGITUDINAL RECOVERY BANK
+    # ============================================================
+    # 15% of particles are used as long-range hypotheses, but they carry
+    # only 10% of total prior probability.
+    #
+    # At N=2000:
+    #   bank particles = ~300
+    #
+    # The bank spans up to +/-4 m along vehicle heading.  During positive
+    # acceleration it is biased forward because the measured 100% failure
+    # is an under-estimated motion prior.
+    recovery_bank_ratio: 0.15
+    recovery_bank_weight: 0.10
+    recovery_bank_half_span: 4.0
+    recovery_bank_min_speed: 4.5
+    recovery_bank_max_abs_wz: 0.25
+    recovery_bank_lateral_sigma: 0.03
+    recovery_bank_yaw_sigma: 0.015
+    recovery_bank_accel_bias_threshold: 0.50
+
+    # ============================================================
+    # RACING V5 MAP / RANGELIB SAFETY
+    # ============================================================
+
+    # Bank must remain straight for at least two ~20-Hz LiDAR updates.
+    # Prevents activation merely because yaw rate crosses zero between turns.
+    recovery_bank_straight_hold_time: 0.10
+
+    # Keep long-range hypotheses away from map boundaries.
+    recovery_bank_map_margin: 0.10
+
+    # Do not spend recovery particles inside walls / unknown map cells.
+    recovery_bank_require_free_space: true
+
+    # Absolute last-resort guard for every RangeLib ray origin.
+    raycast_map_margin: 0.05
+
+    # ============================================================
     # ESS RESAMPLING
     # ============================================================
-    ess_threshold_ratio: 0.45
+    ess_threshold_ratio: 0.35
 
     # ============================================================
     # KNOWN START POSE

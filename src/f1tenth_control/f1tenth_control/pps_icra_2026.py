@@ -13,7 +13,7 @@ from std_msgs.msg import Float32, Int32
 
 
 # =============================================================================
-# RoboRacer ICRA 2026 - Competition-Legal Pure Pursuit for /1.15
+# RoboRacer ICRA 2026 - Competition-Legal Pure Pursuit at 100% CSV speed
 # =============================================================================
 #
 # INPUTS USED BY THIS CONTROLLER
@@ -43,7 +43,7 @@ from std_msgs.msg import Float32, Int32
 # WHY THIS VERSION EXISTS
 # =============================================================================
 #
-# The /1.15 rosbag showed that localization was still accurate near the middle
+# The high-speed rosbag showed that localization was still accurate near the middle
 # S-turn, but our added "turn-in gate" was forcing steering lookahead down to
 # ~0.70 m while normal speed-based Pure Pursuit wanted ~2.0 m.
 #
@@ -81,10 +81,51 @@ from std_msgs.msg import Float32, Int32
 CONTROL_PERIOD = 0.020          # 50 Hz
 
 # Fast/gentle sections.
-VELOCITY_DIVISOR = 1.15
+VELOCITY_DIVISOR = 1.00
 
 # Tight-corner protection remains at the already-proven safe level.
 TIGHT_CORNER_DIVISOR = 1.50
+
+# -------------------------------------------------------------------------
+# COLD-START MANAGER
+# -------------------------------------------------------------------------
+#
+# Flying laps are already proven at 100%: 13 clean laps around 10.2 s.
+# Do NOT alter that steady-state behavior.
+#
+# The only special handling is for a controller start from rest.
+#
+# During the standing launch:
+#   - use the proven /1.15 fast divisor temporarily,
+#   - ramp throttle smoothly,
+#   - wait for PF longitudinal covariance + wheel innovation to stabilize,
+#   - then blend to full 100% over a short interval.
+#
+# After state FULL is reached, this logic never activates again.
+#
+COLD_START_SPEED_THRESHOLD = 0.50    # [m/s]
+
+LAUNCH_FAST_DIVISOR = 1.15
+LAUNCH_MIN_TIME = 1.00               # [s]
+LAUNCH_RELEASE_SPEED = 5.00          # [m/s]
+
+# At full speed the long corridor is genuinely weakly observable in the
+# longitudinal direction, so PF sigma can correctly be 0.30-0.40 m there.
+# Do NOT block launch release on PF sigma <= 0.20 m.
+#
+# We require PF to be FRESH, but launch release is based on odometry
+# consistency because wheel spin is the startup-specific failure mechanism.
+LAUNCH_WHEEL_INNOVATION_MAX = 0.55   # [m/s]
+LAUNCH_STABLE_TIME = 0.12            # [s]
+
+LAUNCH_BLEND_TIME = 0.40             # [s] 1.15 -> 1.00
+LAUNCH_THROTTLE_RAMP_TIME = 0.75     # [s]
+
+PF_STALE_TIMEOUT = 0.20              # [s]
+
+# If speed is already high and wheel innovation has settled, release even
+# while the corridor PF covariance remains elongated.
+LAUNCH_RELEASE_SPEED = 5.50          # [m/s]
 
 # Smooth curvature-based speed-divisor blend.
 CURVATURE_DIVISOR_START = 0.60       # [1/m]
@@ -108,6 +149,27 @@ MAX_STEERING_RAD = 0.5236
 STEER_LOOKAHEAD_GAIN = 0.45
 STEER_LOOKAHEAD_MIN = 0.70
 STEER_LOOKAHEAD_MAX = 2.00
+
+# -------------------------------------------------------------------------
+# V5 LEFT-CORNER / S-BEND STABILITY
+# -------------------------------------------------------------------------
+#
+# Use path ARC LENGTH for steering target selection and stop a long
+# high-speed lookahead from jumping deeply across an upcoming curvature-sign
+# reversal.
+#
+CURVATURE_SIGN_THRESHOLD = 0.04      # [1/m]
+DIRECTION_CHANGE_PREVIEW = 0.35      # [m] preview beyond sign reversal
+DIRECTION_CHANGE_SEARCH_EXTRA = 0.75 # [m]
+
+# The uploaded bag shows ~0.11-0.13 s actuator lag in the sharp left corner.
+# Keep the desired command from outrunning the measured actuator by too much.
+# This value is normalized steering units.
+STEERING_TRACKING_ERROR_MAX = 0.75
+
+# Normalized command units per second.
+# At 50 Hz this allows about 0.10 command change per controller tick.
+STEERING_COMMAND_RATE_LIMIT = 5.0
 
 # Measured steering actuator delay.
 STEERING_LATENCY_COMP = 0.115       # [s]
@@ -137,6 +199,38 @@ SPEED_ACCEL_PREVIEW_TIME = 0.42     # [s]
 SPEED_ACCEL_PREVIEW_MAX = 3.30      # [m]
 
 SPEED_TREND_EPS = 0.05              # [m/s]
+
+# -------------------------------------------------------------------------
+# 100% OVERSPEED / CORNER-EXIT GUARD
+# -------------------------------------------------------------------------
+#
+# The logged failure showed:
+#
+#   v=5.65, target=4.23, mode=ACCEL
+#   v=6.93, target=5.17, mode=ACCEL
+#
+# The long acceleration preview was reopening throttle because the CSV profile
+# rises farther ahead, even though the REAL current vehicle speed was still
+# well above that future target.
+#
+# This is NOT a PID.  It is a state-machine safety condition for feedforward:
+# do not re-enable acceleration until actual speed has caught the profile.
+#
+ACCEL_PERMISSION_MARGIN = 0.20       # [m/s]
+
+# IMPORTANT:
+# Do NOT multiply throttle toward zero because of overspeed.
+#
+# The final bag proved that a ~5% throttle scale can collapse driven-wheel
+# speed almost to zero while chassis speed remains 3-4 m/s.  That creates a
+# false wheel-odometry measurement and destabilizes the entire estimator.
+#
+# Overspeed is therefore handled by MODE SELECTION only:
+#
+#   - ACCEL is blocked while actual speed is already above the future target.
+#   - COAST/HOLD use the local CSV feedforward target normally.
+#
+# This restores the throttle behavior of the earlier stable 100% run.
 
 # Offset lookahead.
 # With IPS, 0.05 m was enough.  With our legal localization stack the
@@ -488,6 +582,115 @@ def find_steering_lookahead_index(
 
 
 # =============================================================================
+# V5 STEERING ARC-LENGTH / DIRECTION-CHANGE HELPERS
+# =============================================================================
+
+def first_curvature_sign_change_distance(
+    start_idx,
+    max_distance
+):
+    """
+    Return the path arc distance to the first meaningful curvature-sign
+    reversal ahead.
+
+    Tiny near-zero curvature is ignored to avoid numerical sign flicker.
+    """
+
+    idx = int(
+        start_idx
+    ) % path_len
+
+    current_sign = 0
+
+    # Find the current meaningful bend direction.
+    for offset in range(8):
+
+        kappa = float(
+            path_signed_curvature[
+                (idx + offset) % path_len
+            ]
+        )
+
+        if abs(
+            kappa
+        ) >= CURVATURE_SIGN_THRESHOLD:
+
+            current_sign = (
+                1
+                if kappa > 0.0
+                else -1
+            )
+
+            break
+
+    if current_sign == 0:
+        return None, None
+
+    travelled = 0.0
+
+    for _ in range(path_len):
+
+        next_idx = (
+            idx + 1
+        ) % path_len
+
+        travelled += float(
+            np.linalg.norm(
+                goal[next_idx]
+                -
+                goal[idx]
+            )
+        )
+
+        idx = next_idx
+
+        kappa = float(
+            path_signed_curvature[
+                idx
+            ]
+        )
+
+        if abs(
+            kappa
+        ) >= CURVATURE_SIGN_THRESHOLD:
+
+            sign_here = (
+                1
+                if kappa > 0.0
+                else -1
+            )
+
+            if sign_here != current_sign:
+
+                return (
+                    travelled,
+                    idx
+                )
+
+        if travelled > max_distance:
+            break
+
+    return None, None
+
+
+def steering_lookahead_index_by_arc_length(
+    start_idx,
+    distance_m
+):
+    """
+    Select steering target by FORWARD PATH ARC LENGTH.
+
+    This prevents a hairpin/chicane from making the target jump to a nearby
+    but topologically distant branch of the path.
+    """
+
+    return advance_path_index_by_distance(
+        start_idx,
+        distance_m
+    )
+
+
+# =============================================================================
 # CURVATURE-DEPENDENT SPEED SCALING
 # =============================================================================
 
@@ -524,7 +727,8 @@ def speed_curvature_at_index(
 
 
 def curvature_speed_divisor(
-    curvature
+    curvature,
+    fast_divisor=VELOCITY_DIVISOR
 ):
     """
     Straight/gentle:
@@ -558,14 +762,14 @@ def curvature_speed_divisor(
     )
 
     return float(
-        VELOCITY_DIVISOR
+        fast_divisor
         +
         blend
         *
         (
             TIGHT_CORNER_DIVISOR
             -
-            VELOCITY_DIVISOR
+            fast_divisor
         )
     )
 
@@ -1158,9 +1362,32 @@ class RoboRacerController(Node):
         self.car_yaw = 0.0
         self.car_yaw_rate = 0.0
 
+        # Allowed measured steering input.
+        self.measured_steering_rad = 0.0
+        self.measured_steering_received = False
+
+        # Final command state for actuator-aware slew limiting.
+        self.last_steering_command = 0.0
+        self.last_steering_command_time = None
+
         self.localization_received = False
         self.speed_received = False
         self.imu_received = False
+
+        # Cold-start estimator-health inputs.
+        self.pf_received = False
+        self.pf_sigma_max = float('inf')
+        self.last_pf_receive_time = None
+
+        self.wheel_innovation_received = False
+        self.wheel_innovation = float('inf')
+
+        # Launch-state machine:
+        #   UNINITIALIZED -> SAFE -> BLEND -> FULL
+        self.launch_state = 'UNINITIALIZED'
+        self.launch_start_time = None
+        self.launch_stable_start_time = None
+        self.launch_blend_start_time = None
 
         self.control_counter = 0
 
@@ -1210,6 +1437,29 @@ class RoboRacerController(Node):
             Imu,
             '/autodrive/roboracer_1/imu',
             self.imu_callback,
+            20
+        )
+
+        # Competition-permitted measured steering sensor.
+        self.measured_steering_sub = self.create_subscription(
+            Float32,
+            '/autodrive/roboracer_1/steering',
+            self.measured_steering_callback,
+            20
+        )
+
+        # Internal estimator-health topics derived only from permitted sensors.
+        self.pf_sub = self.create_subscription(
+            Odometry,
+            '/pf/pose/odom',
+            self.pf_callback,
+            20
+        )
+
+        self.wheel_innovation_sub = self.create_subscription(
+            Float32,
+            '/roboracer/odom_debug/wheel_innovation',
+            self.wheel_innovation_callback,
             20
         )
 
@@ -1298,7 +1548,7 @@ class RoboRacerController(Node):
         )
 
         self.get_logger().info(
-            'RoboRacer /1.15 LEGAL CUT-GUARD controller started | '
+            'RoboRacer 100% LEGAL LEFT-CORNER-V5 controller started | '
             f'control={1.0 / CONTROL_PERIOD:.1f} Hz | '
             f'fast_div={VELOCITY_DIVISOR:.2f} | '
             f'tight_div={TIGHT_CORNER_DIVISOR:.2f} | '
@@ -1364,6 +1614,309 @@ class RoboRacerController(Node):
         )
 
         self.imu_received = True
+
+    def measured_steering_callback(
+        self,
+        msg: Float32
+    ):
+
+        self.measured_steering_rad = float(
+            msg.data
+        )
+
+        self.measured_steering_received = True
+
+    def pf_callback(
+        self,
+        msg: Odometry
+    ):
+        """
+        Read only PF covariance/health.  PF position is NOT used directly by
+        the controller; control position remains /localization/odom.
+        """
+
+        covariance = np.asarray(
+            msg.pose.covariance,
+            dtype=float
+        )
+
+        covariance_xy = np.array([
+            [
+                covariance[0],
+                covariance[1]
+            ],
+            [
+                covariance[6],
+                covariance[7]
+            ]
+        ], dtype=float)
+
+        covariance_xy = 0.5 * (
+            covariance_xy
+            +
+            covariance_xy.T
+        )
+
+        eigenvalues = np.linalg.eigvalsh(
+            covariance_xy
+        )
+
+        eigenvalues = np.maximum(
+            eigenvalues,
+            0.0
+        )
+
+        self.pf_sigma_max = float(
+            np.sqrt(
+                np.max(
+                    eigenvalues
+                )
+            )
+        )
+
+        self.pf_received = True
+        self.last_pf_receive_time = (
+            self.get_clock().now()
+        )
+
+    def wheel_innovation_callback(
+        self,
+        msg: Float32
+    ):
+
+        self.wheel_innovation = float(
+            msg.data
+        )
+
+        self.wheel_innovation_received = True
+
+    # =========================================================================
+    # COLD START MANAGER
+    # =========================================================================
+
+    def update_launch_manager(
+        self,
+        current_speed
+    ):
+        """
+        Returns:
+            fast_divisor
+            throttle_scale
+
+        The steady-state FULL mode is exactly the proven 100% controller.
+        """
+
+        now = self.get_clock().now()
+
+        # --------------------------------------------------------------
+        # Decide once whether this is a cold standing start.
+        # --------------------------------------------------------------
+
+        if self.launch_state == 'UNINITIALIZED':
+
+            if current_speed <= COLD_START_SPEED_THRESHOLD:
+
+                self.launch_state = 'SAFE'
+                self.launch_start_time = now
+                self.launch_stable_start_time = None
+
+                self.get_logger().info(
+                    'Cold standing start detected: '
+                    'temporary /1.15 launch protection enabled.'
+                )
+
+            else:
+
+                self.launch_state = 'FULL'
+
+                self.get_logger().info(
+                    'Controller started while moving: '
+                    'using full 100% racing mode immediately.'
+                )
+
+        # --------------------------------------------------------------
+        # Full racing mode.
+        # --------------------------------------------------------------
+
+        if self.launch_state == 'FULL':
+
+            return (
+                VELOCITY_DIVISOR,
+                1.0
+            )
+
+        # --------------------------------------------------------------
+        # Blend from safe launch to full 100%.
+        # --------------------------------------------------------------
+
+        if self.launch_state == 'BLEND':
+
+            elapsed_blend = (
+                now
+                -
+                self.launch_blend_start_time
+            ).nanoseconds * 1e-9
+
+            blend = float(
+                np.clip(
+                    elapsed_blend
+                    /
+                    max(
+                        LAUNCH_BLEND_TIME,
+                        1e-6
+                    ),
+                    0.0,
+                    1.0
+                )
+            )
+
+            fast_divisor = (
+                LAUNCH_FAST_DIVISOR
+                +
+                blend
+                *
+                (
+                    VELOCITY_DIVISOR
+                    -
+                    LAUNCH_FAST_DIVISOR
+                )
+            )
+
+            if blend >= 1.0:
+
+                self.launch_state = 'FULL'
+
+                self.get_logger().info(
+                    'Launch estimator stabilized: '
+                    '100% racing mode enabled.'
+                )
+
+                return (
+                    VELOCITY_DIVISOR,
+                    1.0
+                )
+
+            return (
+                fast_divisor,
+                1.0
+            )
+
+        # --------------------------------------------------------------
+        # SAFE standing-launch mode.
+        # --------------------------------------------------------------
+
+        elapsed = (
+            now
+            -
+            self.launch_start_time
+        ).nanoseconds * 1e-9
+
+        # Smooth first throttle application to reduce physical wheel spin.
+        throttle_scale = float(
+            np.clip(
+                elapsed
+                /
+                max(
+                    LAUNCH_THROTTLE_RAMP_TIME,
+                    1e-6
+                ),
+                0.0,
+                1.0
+            )
+        )
+
+        pf_fresh = False
+
+        if (
+            self.pf_received
+            and
+            self.last_pf_receive_time is not None
+        ):
+
+            pf_age = (
+                now
+                -
+                self.last_pf_receive_time
+            ).nanoseconds * 1e-9
+
+            pf_fresh = (
+                pf_age
+                <=
+                PF_STALE_TIMEOUT
+            )
+
+        # Corridor PF covariance is allowed to be elongated.
+        # For startup release we only require that PF is alive/fresh.
+        pf_ok = (
+            pf_fresh
+        )
+
+        wheel_ok = (
+            self.wheel_innovation_received
+            and
+            abs(
+                self.wheel_innovation
+            )
+            <=
+            LAUNCH_WHEEL_INNOVATION_MAX
+        )
+
+        speed_ok = (
+            current_speed
+            >=
+            LAUNCH_RELEASE_SPEED
+        )
+
+        time_ok = (
+            elapsed
+            >=
+            LAUNCH_MIN_TIME
+        )
+
+        stable_now = (
+            pf_ok
+            and
+            wheel_ok
+            and
+            speed_ok
+            and
+            time_ok
+        )
+
+        if stable_now:
+
+            if self.launch_stable_start_time is None:
+
+                self.launch_stable_start_time = now
+
+            stable_duration = (
+                now
+                -
+                self.launch_stable_start_time
+            ).nanoseconds * 1e-9
+
+            if (
+                stable_duration
+                >=
+                LAUNCH_STABLE_TIME
+            ):
+
+                self.launch_state = 'BLEND'
+                self.launch_blend_start_time = now
+
+                self.get_logger().info(
+                    'Cold-start odometry consistency reached with fresh PF: '
+                    'blending /1.15 -> 100%.'
+                )
+
+        else:
+
+            self.launch_stable_start_time = None
+
+        return (
+            LAUNCH_FAST_DIVISOR,
+            throttle_scale
+        )
 
     # =========================================================================
     # DEBUG
@@ -1505,6 +2058,13 @@ class RoboRacerController(Node):
             self.car_yaw_rate
         )
 
+        (
+            active_fast_divisor,
+            launch_throttle_scale
+        ) = self.update_launch_manager(
+            current_speed
+        )
+
         # ------------------------------------------------------------------
         # Current local path progress.
         # ------------------------------------------------------------------
@@ -1590,7 +2150,7 @@ class RoboRacerController(Node):
         )
 
         # Proven lookahead law remains the sole lookahead rule.
-        steering_lookahead = float(
+        base_steering_lookahead = float(
             np.clip(
                 STEER_LOOKAHEAD_GAIN
                 *
@@ -1600,10 +2160,54 @@ class RoboRacerController(Node):
             )
         )
 
+        # --------------------------------------------------------------
+        # V5 S-BEND / HAIRPIN DIRECTION-CHANGE GUARD
+        #
+        # Keep the proven dynamic lookahead, but if an opposite-curvature
+        # section lies inside that lookahead, do not target deeply through
+        # the whole hairpin.  Allow only a modest 0.35 m preview past the
+        # reversal.
+        # --------------------------------------------------------------
+
+        (
+            direction_change_distance,
+            direction_change_idx
+        ) = first_curvature_sign_change_distance(
+            steering_nearest_idx,
+            base_steering_lookahead
+            +
+            DIRECTION_CHANGE_SEARCH_EXTRA
+        )
+
+        direction_change_active = False
+
+        steering_lookahead = (
+            base_steering_lookahead
+        )
+
+        if (
+            direction_change_distance is not None
+            and
+            direction_change_distance
+            <
+            base_steering_lookahead
+        ):
+
+            steering_lookahead = max(
+                STEER_LOOKAHEAD_MIN,
+                min(
+                    base_steering_lookahead,
+                    direction_change_distance
+                    +
+                    DIRECTION_CHANGE_PREVIEW
+                )
+            )
+
+            direction_change_active = True
+
         self.lookahead_idx = (
-            find_steering_lookahead_index(
+            steering_lookahead_index_by_arc_length(
                 steering_nearest_idx,
-                steering_position,
                 steering_lookahead
             )
         )
@@ -1671,7 +2275,7 @@ class RoboRacerController(Node):
             curvature_command
         )
 
-        normalized_steering = float(
+        raw_normalized_steering = float(
             np.clip(
                 steering_angle
                 /
@@ -1679,6 +2283,103 @@ class RoboRacerController(Node):
                 -1.0,
                 1.0
             )
+        )
+
+        # --------------------------------------------------------------
+        # V5 ACTUATOR-AWARE STABILIZER
+        #
+        # The failing bag shows the desired command changing from roughly
+        # +0.7 -> -1.0 -> +1.0 while the physical steering is still carrying
+        # the previous sign.  Limit how far the command can lead the measured
+        # actuator, then apply a mild command slew limit.
+        # --------------------------------------------------------------
+
+        actuator_aware_steering = (
+            raw_normalized_steering
+        )
+
+        if self.measured_steering_received:
+
+            measured_normalized_steering = float(
+                np.clip(
+                    self.measured_steering_rad
+                    /
+                    MAX_STEERING_RAD,
+                    -1.0,
+                    1.0
+                )
+            )
+
+            actuator_aware_steering = float(
+                np.clip(
+                    raw_normalized_steering,
+                    measured_normalized_steering
+                    -
+                    STEERING_TRACKING_ERROR_MAX,
+                    measured_normalized_steering
+                    +
+                    STEERING_TRACKING_ERROR_MAX
+                )
+            )
+
+        else:
+
+            measured_normalized_steering = 0.0
+
+        steering_now = self.get_clock().now()
+
+        if self.last_steering_command_time is None:
+
+            steering_dt = CONTROL_PERIOD
+
+        else:
+
+            steering_dt = (
+                steering_now
+                -
+                self.last_steering_command_time
+            ).nanoseconds * 1e-9
+
+            steering_dt = float(
+                np.clip(
+                    steering_dt,
+                    0.005,
+                    0.050
+                )
+            )
+
+        max_command_delta = (
+            STEERING_COMMAND_RATE_LIMIT
+            *
+            steering_dt
+        )
+
+        normalized_steering = float(
+            np.clip(
+                actuator_aware_steering,
+                self.last_steering_command
+                -
+                max_command_delta,
+                self.last_steering_command
+                +
+                max_command_delta
+            )
+        )
+
+        normalized_steering = float(
+            np.clip(
+                normalized_steering,
+                -1.0,
+                1.0
+            )
+        )
+
+        self.last_steering_command = (
+            normalized_steering
+        )
+
+        self.last_steering_command_time = (
+            steering_now
         )
 
         # ------------------------------------------------------------------
@@ -1696,7 +2397,8 @@ class RoboRacerController(Node):
 
         current_divisor = (
             curvature_speed_divisor(
-                current_speed_curvature
+                current_speed_curvature,
+                active_fast_divisor
             )
         )
 
@@ -1736,7 +2438,8 @@ class RoboRacerController(Node):
 
         decel_divisor = (
             curvature_speed_divisor(
-                decel_curvature
+                decel_curvature,
+                active_fast_divisor
             )
         )
 
@@ -1776,7 +2479,8 @@ class RoboRacerController(Node):
 
         accel_divisor = (
             curvature_speed_divisor(
-                accel_curvature
+                accel_curvature,
+                active_fast_divisor
             )
         )
 
@@ -1788,7 +2492,30 @@ class RoboRacerController(Node):
             accel_divisor
         )
 
-        # Approaching slower profile.
+        # ------------------------------------------------------------------
+        # ACTUAL-SPEED-AWARE SPEED MODE
+        #
+        # The acceleration preview is allowed only if the current vehicle
+        # speed is not already above the future acceleration target.
+        #
+        # This prevents:
+        #
+        #     actual 6.9 m/s
+        #     target 5.2 m/s
+        #     mode ACCEL
+        #
+        # which was the direct high-speed corner failure in the log.
+        # ------------------------------------------------------------------
+
+        accel_is_permitted = (
+            current_speed
+            <=
+            accel_target_velocity
+            +
+            ACCEL_PERMISSION_MARGIN
+        )
+
+        # Approaching slower profile always has priority.
         if (
             decel_target_velocity
             <
@@ -1819,13 +2546,16 @@ class RoboRacerController(Node):
                 decel_target_velocity
             )
 
-        # Profile opening up.
+        # Profile opening up, but only accelerate if actual speed has already
+        # caught the requested future speed.
         elif (
             accel_target_velocity
             >
             current_profile_velocity
             +
             SPEED_TREND_EPS
+            and
+            accel_is_permitted
         ):
 
             speed_mode = 'ACCEL'
@@ -1850,7 +2580,35 @@ class RoboRacerController(Node):
                 accel_target_velocity
             )
 
-        # Nearly flat section.
+        # Profile is opening, but vehicle is still too fast.
+        elif (
+            accel_target_velocity
+            >
+            current_profile_velocity
+            +
+            SPEED_TREND_EPS
+        ):
+
+            speed_mode = 'COAST'
+
+            self.speed_idx = (
+                self.nearest_path_idx
+            )
+
+            speed_preview_distance = 0.0
+
+            speed_path_curvature = (
+                current_speed_curvature
+            )
+
+            effective_divisor = (
+                current_divisor
+            )
+
+            target_velocity = (
+                current_profile_velocity
+            )
+
         else:
 
             speed_mode = 'HOLD'
@@ -1873,10 +2631,32 @@ class RoboRacerController(Node):
                 current_profile_velocity
             )
 
+        # ------------------------------------------------------------------
+        # FEEDFORWARD THROTTLE - NO HARD / NEAR-HARD CUT
+        #
+        # ACCEL permission above already prevents the controller from looking
+        # far down the CSV and reopening throttle prematurely.
+        #
+        # Here we simply command the selected profile feedforward.  This is
+        # intentionally close to the throttle behavior from the earlier
+        # collision-free 100% run.
+        # ------------------------------------------------------------------
+
+        overspeed_error = max(
+            0.0,
+            current_speed
+            -
+            target_velocity
+        )
+
+        overspeed_throttle_scale = 1.0
+
         throttle_command = (
             speed_control(
                 target_velocity
             )
+            *
+            launch_throttle_scale
         )
 
         # ------------------------------------------------------------------
@@ -1927,8 +2707,14 @@ class RoboRacerController(Node):
                 f'v={current_speed:.2f} m/s | '
                 f'target={target_velocity:.2f} | '
                 f'throttle={throttle_command:.3f} | '
+                f'over={overspeed_error:.2f} | '
+                f'th_scale={overspeed_throttle_scale:.2f} | '
                 f'steer={normalized_steering:.3f} | '
-                f'L={steering_lookahead:.2f} m | '
+                f'raw={raw_normalized_steering:.3f} | '
+                f'meas={measured_normalized_steering:.3f} | '
+                f'L={steering_lookahead:.2f}/'
+                f'{base_steering_lookahead:.2f} m | '
+                f'dirchg={direction_change_active} | '
                 f'pred={prediction_distance:.2f}/{prediction_distance_cap:.2f} m | '
                 f'inside={inside_error:.3f} m | '
                 f'guard={cut_guard_blend:.2f} | '
@@ -1937,6 +2723,10 @@ class RoboRacerController(Node):
                 f'preview={speed_preview_distance:.2f} m | '
                 f'kappa={speed_path_curvature:.2f} | '
                 f'div={effective_divisor:.3f} | '
+                f'launch={self.launch_state} | '
+                f'fast_div={active_fast_divisor:.3f} | '
+                f'PFsig={self.pf_sigma_max:.3f} | '
+                f'wheelInnov={self.wheel_innovation:.2f} | '
                 f'idx={self.nearest_path_idx}'
             )
 

@@ -232,6 +232,158 @@ class AckermannOdom(Node):
             1.05
         )
 
+        # ------------------------------------------------------------------
+        # V4 COLD-START / STANDING-LAUNCH PROTECTION
+        #
+        # The 100%-speed bag shows that the first standing launch is very
+        # different from the later flying laps:
+        #
+        #   standing launch:
+        #       wheel speed can be 2-3+ m/s above chassis speed
+        #
+        #   flying lap:
+        #       wheel/chassis disagreement is normally only a few tenths m/s
+        #
+        # V3 detected spin mainly from:
+        #       wheel_acceleration - IMU_acceleration
+        #
+        # but sustained slip can have similar acceleration on both signals,
+        # leaving a large positive wheel SPEED innovation undetected.
+        #
+        # V4 uses BOTH:
+        #       acceleration excess
+        #       positive wheel-speed innovation
+        #
+        # during one latched launch phase.  Once the first acceleration event
+        # ends, the estimator permanently returns to the proven V3 behavior.
+        # ------------------------------------------------------------------
+
+        self.declare_parameter(
+            "launch_mode_enabled",
+            True
+        )
+
+        self.declare_parameter(
+            "launch_imu_accel_scale",
+            1.00
+        )
+
+        # Positive wheel innovation <= this is considered low slip.
+        self.declare_parameter(
+            "launch_innovation_slip_low",
+            0.50
+        )
+
+        # Positive wheel innovation >= this is treated as severe slip.
+        self.declare_parameter(
+            "launch_innovation_slip_high",
+            1.10
+        )
+
+        # When launch slip is low, permit only a small wheel correction.
+        self.declare_parameter(
+            "launch_wheel_gain_low_slip",
+            0.10
+        )
+
+        # Under severe positive wheel slip, do not chase wheel speed upward.
+        self.declare_parameter(
+            "launch_wheel_gain_high_slip",
+            0.0
+        )
+
+        self.declare_parameter(
+            "launch_correction_step_low_slip",
+            0.015
+        )
+
+        self.declare_parameter(
+            "launch_correction_step_high_slip",
+            0.0
+        )
+
+        # Negative wheel innovation is useful: it prevents IMU integration
+        # from running ahead, so retain a strong bounded negative correction.
+        self.declare_parameter(
+            "launch_negative_gain",
+            0.50
+        )
+
+        self.declare_parameter(
+            "launch_negative_step",
+            0.08
+        )
+
+        # The launch phase ends only after the first hard acceleration has
+        # clearly finished.
+        self.declare_parameter(
+            "launch_exit_speed",
+            5.0
+        )
+
+        self.declare_parameter(
+            "launch_exit_stable_time",
+            0.10
+        )
+
+        # If this node is restarted while the car is already moving, detect
+        # that state rather than applying standing-launch logic.
+        self.declare_parameter(
+            "moving_restart_speed",
+            2.0
+        )
+
+        self.declare_parameter(
+            "moving_restart_accel_max",
+            0.50
+        )
+
+        # ------------------------------------------------------------------
+        # V7 BRAKING WHEEL-SLIP / WHEEL-LOCK PROTECTION
+        #
+        # Keep the proven V3 flying-lap estimator unchanged in normal motion.
+        #
+        # The final 100% bag shows a specific failure during aggressive
+        # deceleration:
+        #
+        #   chassis speed  ~3-4 m/s
+        #   driven wheel   ~0.2 m/s
+        #
+        # The wheel therefore decelerates MUCH faster than the IMU/chassis.
+        # That is wheel lock / drivetrain slip, not true chassis speed.
+        #
+        # Latch wheel-lock only when:
+        #   1) wheel speed is already substantially below prediction, AND
+        #   2) wheel acceleration is much more negative than IMU acceleration.
+        #
+        # While latched:
+        #   - negative wheel corrections are ignored;
+        #   - IMU predicts chassis deceleration;
+        #   - positive/caught-up wheel data releases the latch.
+        #
+        # Outside this rare condition the original proven V3 fusion remains.
+        # ------------------------------------------------------------------
+
+        self.declare_parameter(
+            "brake_slip_innovation_threshold",
+            -0.80
+        )
+
+        self.declare_parameter(
+            "brake_slip_accel_excess",
+            4.0
+        )
+
+        self.declare_parameter(
+            "brake_slip_release_innovation",
+            -0.25
+        )
+
+        self.declare_parameter(
+            "brake_slip_release_time",
+            0.06
+        )
+
         self.declare_parameter(
             "imu_accel_deadband",
             0.03
@@ -317,6 +469,114 @@ class AckermannOdom(Node):
         self.positive_imu_accel_scale = float(
             self.get_parameter(
                 "positive_imu_accel_scale"
+            ).value
+        )
+
+        self.launch_mode_enabled = bool(
+            self.get_parameter(
+                "launch_mode_enabled"
+            ).value
+        )
+
+        self.launch_imu_accel_scale = float(
+            self.get_parameter(
+                "launch_imu_accel_scale"
+            ).value
+        )
+
+        self.launch_innovation_slip_low = float(
+            self.get_parameter(
+                "launch_innovation_slip_low"
+            ).value
+        )
+
+        self.launch_innovation_slip_high = float(
+            self.get_parameter(
+                "launch_innovation_slip_high"
+            ).value
+        )
+
+        self.launch_wheel_gain_low_slip = float(
+            self.get_parameter(
+                "launch_wheel_gain_low_slip"
+            ).value
+        )
+
+        self.launch_wheel_gain_high_slip = float(
+            self.get_parameter(
+                "launch_wheel_gain_high_slip"
+            ).value
+        )
+
+        self.launch_correction_step_low_slip = float(
+            self.get_parameter(
+                "launch_correction_step_low_slip"
+            ).value
+        )
+
+        self.launch_correction_step_high_slip = float(
+            self.get_parameter(
+                "launch_correction_step_high_slip"
+            ).value
+        )
+
+        self.launch_negative_gain = float(
+            self.get_parameter(
+                "launch_negative_gain"
+            ).value
+        )
+
+        self.launch_negative_step = float(
+            self.get_parameter(
+                "launch_negative_step"
+            ).value
+        )
+
+        self.launch_exit_speed = float(
+            self.get_parameter(
+                "launch_exit_speed"
+            ).value
+        )
+
+        self.launch_exit_stable_time = float(
+            self.get_parameter(
+                "launch_exit_stable_time"
+            ).value
+        )
+
+        self.moving_restart_speed = float(
+            self.get_parameter(
+                "moving_restart_speed"
+            ).value
+        )
+
+        self.moving_restart_accel_max = float(
+            self.get_parameter(
+                "moving_restart_accel_max"
+            ).value
+        )
+
+        self.brake_slip_innovation_threshold = float(
+            self.get_parameter(
+                "brake_slip_innovation_threshold"
+            ).value
+        )
+
+        self.brake_slip_accel_excess = float(
+            self.get_parameter(
+                "brake_slip_accel_excess"
+            ).value
+        )
+
+        self.brake_slip_release_innovation = float(
+            self.get_parameter(
+                "brake_slip_release_innovation"
+            ).value
+        )
+
+        self.brake_slip_release_time = float(
+            self.get_parameter(
+                "brake_slip_release_time"
             ).value
         )
 
@@ -463,6 +723,18 @@ class AckermannOdom(Node):
         self.last_accel_wheel_gain = 0.0
         self.last_accel_correction = 0.0
 
+        # V4 launch state.
+        self.launch_mode_active = bool(
+            self.launch_mode_enabled
+        )
+        self.launch_exit_accumulator = 0.0
+        self.last_launch_innovation_factor = 0.0
+
+        # V7 braking wheel-slip state.
+        self.brake_slip_active = False
+        self.brake_slip_release_accumulator = 0.0
+        self.last_wheel_accel_error = 0.0
+
         # ==================================================================
         # ODOMETRY STATE
         # ==================================================================
@@ -582,7 +854,7 @@ class AckermannOdom(Node):
         self.odom_msg.child_frame_id = "roboracer_1"
 
         self.get_logger().info(
-            "Ackermann Odom IMU-HYBRID V3 started: "
+            "Ackermann Odom IMU-HYBRID V7 RACING started: "
             f"steady_wheel_gain={self.wheel_correction_gain:.2f}, "
             f"accel_gain=[{self.accel_wheel_gain_low_spin:.3f}, "
             f"{self.accel_wheel_gain_high_spin:.3f}], "
@@ -1022,15 +1294,35 @@ class AckermannOdom(Node):
             accel
         )
 
-        if accel > self.positive_accel_threshold:
+        # Standing launch uses the raw calibrated IMU acceleration.  The
+        # later flying-lap V3 mode retains its existing +5% positive scale.
+        if (
+            self.launch_mode_active
+            and
+            accel > self.positive_accel_threshold
+        ):
             accel_for_prediction = (
-                accel *
+                accel
+                *
+                self.launch_imu_accel_scale
+            )
+
+        elif accel > self.positive_accel_threshold:
+
+            accel_for_prediction = (
+                accel
+                *
                 self.positive_imu_accel_scale
             )
-        else:
-            accel_for_prediction = accel
 
-        predicted_speed = (
+        else:
+
+            accel_for_prediction = (
+                accel
+            )
+
+        predicted_speed = max(
+            0.0,
             self.vehicle_speed
             +
             accel_for_prediction
@@ -1038,18 +1330,16 @@ class AckermannOdom(Node):
             dt
         )
 
-        predicted_speed = max(
-            0.0,
-            predicted_speed
-        )
-
         # ------------------------------------------------------------------
-        # V3 wheel acceleration / spin estimation
+        # Wheel acceleration
         # ------------------------------------------------------------------
 
         if self.previous_wheel_speed_for_accel is None:
+
             wheel_accel = 0.0
+
         else:
+
             wheel_accel = (
                 wheel_speed
                 -
@@ -1064,7 +1354,7 @@ class AckermannOdom(Node):
             wheel_accel
         )
 
-        spin_excess = max(
+        accel_spin_excess = max(
             0.0,
             wheel_accel
             -
@@ -1072,40 +1362,33 @@ class AckermannOdom(Node):
         )
 
         self.last_spin_excess = (
-            spin_excess
+            accel_spin_excess
         )
 
-        spin_denominator = max(
+        accel_spin_denominator = max(
             1e-6,
             self.spin_excess_accel_high
             -
             self.spin_excess_accel_low
         )
 
-        spin_factor = float(
+        accel_spin_factor = float(
             clamp(
                 (
-                    spin_excess
+                    accel_spin_excess
                     -
                     self.spin_excess_accel_low
                 )
                 /
-                spin_denominator,
+                accel_spin_denominator,
                 0.0,
                 1.0
             )
         )
 
-        self.last_spin_factor = (
-            spin_factor
-        )
-
         # ------------------------------------------------------------------
-        # Asymmetric fusion
+        # Wheel innovation
         # ------------------------------------------------------------------
-
-        self.last_accel_correction = 0.0
-        self.last_accel_wheel_gain = 0.0
 
         if (
             left_fresh
@@ -1119,30 +1402,372 @@ class AckermannOdom(Node):
                 predicted_speed
             )
 
-            self.last_wheel_innovation = (
-                wheel_innovation
+        else:
+
+            wheel_innovation = 0.0
+
+        self.last_wheel_innovation = (
+            wheel_innovation
+        )
+
+        # ------------------------------------------------------------------
+        # V7 BRAKING WHEEL-SLIP DETECTOR
+        # ------------------------------------------------------------------
+
+        wheel_accel_error = (
+            wheel_accel
+            -
+            accel_for_prediction
+        )
+
+        self.last_wheel_accel_error = (
+            wheel_accel_error
+        )
+
+        if (
+            not self.brake_slip_active
+            and
+            wheel_innovation
+            <=
+            self.brake_slip_innovation_threshold
+            and
+            wheel_accel_error
+            <=
+            -self.brake_slip_accel_excess
+        ):
+
+            self.brake_slip_active = True
+            self.brake_slip_release_accumulator = 0.0
+
+            self.get_logger().warn(
+                'Braking wheel slip detected: '
+                f'innovation={wheel_innovation:.2f} m/s, '
+                f'wheel-imu accel error={wheel_accel_error:.2f} m/s^2'
             )
 
-            if accel <= self.positive_accel_threshold:
+        if self.brake_slip_active:
 
-                # Coast / steady / braking:
-                # wheel measurement is reliable and removes IMU drift fast.
-                wheel_trust = 1.0
+            if (
+                wheel_innovation
+                >=
+                self.brake_slip_release_innovation
+            ):
 
-                fused_speed = (
-                    predicted_speed
-                    +
-                    self.wheel_correction_gain
-                    *
-                    wheel_innovation
+                self.brake_slip_release_accumulator += (
+                    dt
                 )
 
             else:
 
-                # Positive acceleration:
-                # determine correction authority from online spin estimate.
+                self.brake_slip_release_accumulator = 0.0
+
+            if (
+                self.brake_slip_release_accumulator
+                >=
+                self.brake_slip_release_time
+            ):
+
+                self.brake_slip_active = False
+                self.brake_slip_release_accumulator = 0.0
+
+                self.get_logger().info(
+                    'Braking wheel slip cleared; '
+                    'restoring normal V3 wheel fusion.'
+                )
+
+        # ------------------------------------------------------------------
+        # Auto-detect a node restart while already moving.
+        # ------------------------------------------------------------------
+
+        if (
+            self.launch_mode_active
+            and
+            self.total_distance < 0.10
+            and
+            self.vehicle_speed < 0.20
+            and
+            wheel_speed >= self.moving_restart_speed
+            and
+            abs(
+                accel_for_prediction
+            ) <= self.moving_restart_accel_max
+        ):
+
+            self.vehicle_speed = (
+                wheel_speed
+            )
+
+            predicted_speed = (
+                wheel_speed
+            )
+
+            self.launch_mode_active = False
+
+            self.get_logger().info(
+                'V4 moving restart detected: '
+                'standing-launch protection bypassed.'
+            )
+
+        # ------------------------------------------------------------------
+        # V4 COLD STANDING-LAUNCH FUSION
+        # ------------------------------------------------------------------
+
+        self.last_accel_correction = 0.0
+        self.last_accel_wheel_gain = 0.0
+        self.last_launch_innovation_factor = 0.0
+
+        if (
+            self.launch_mode_active
+            and
+            left_fresh
+            and
+            right_fresh
+        ):
+
+            innovation_denominator = max(
+                1e-6,
+                self.launch_innovation_slip_high
+                -
+                self.launch_innovation_slip_low
+            )
+
+            innovation_spin_factor = float(
+                clamp(
+                    (
+                        max(
+                            wheel_innovation,
+                            0.0
+                        )
+                        -
+                        self.launch_innovation_slip_low
+                    )
+                    /
+                    innovation_denominator,
+                    0.0,
+                    1.0
+                )
+            )
+
+            self.last_launch_innovation_factor = (
+                innovation_spin_factor
+            )
+
+            # Either acceleration disagreement OR a persistent positive speed
+            # disagreement is sufficient evidence of launch wheel slip.
+            spin_factor = max(
+                accel_spin_factor,
+                innovation_spin_factor
+            )
+
+            self.last_spin_factor = (
+                spin_factor
+            )
+
+            if accel <= self.positive_accel_threshold:
+
+                if (
+                    self.brake_slip_active
+                    and
+                    wheel_innovation < 0.0
+                ):
+
+                    # Driven wheel is under-speeding the chassis.
+                    # Use IMU prediction until the wheel catches back up.
+                    wheel_trust = 0.0
+                    fused_speed = predicted_speed
+
+                else:
+
+                    # Exact proven V3 behavior in normal coast/braking.
+                    wheel_trust = 1.0
+
+                    fused_speed = (
+                        predicted_speed
+                        +
+                        self.wheel_correction_gain
+                        *
+                        wheel_innovation
+                    )
+
+            elif wheel_innovation >= 0.0:
+
+                # Positive innovation during launch can be wheel spin.
+                gain = (
+                    self.launch_wheel_gain_low_slip
+                    +
+                    spin_factor
+                    *
+                    (
+                        self.launch_wheel_gain_high_slip
+                        -
+                        self.launch_wheel_gain_low_slip
+                    )
+                )
+
+                step_cap = (
+                    self.launch_correction_step_low_slip
+                    +
+                    spin_factor
+                    *
+                    (
+                        self.launch_correction_step_high_slip
+                        -
+                        self.launch_correction_step_low_slip
+                    )
+                )
+
+                requested_correction = (
+                    gain
+                    *
+                    min(
+                        wheel_innovation,
+                        self.positive_wheel_innovation_cap
+                    )
+                )
+
+                applied_correction = clamp(
+                    requested_correction,
+                    -step_cap,
+                    step_cap
+                )
+
+                fused_speed = (
+                    predicted_speed
+                    +
+                    applied_correction
+                )
+
                 wheel_trust = (
-                    1.0 -
+                    1.0
+                    -
+                    spin_factor
+                )
+
+                self.last_accel_wheel_gain = (
+                    gain
+                )
+
+                self.last_accel_correction = (
+                    applied_correction
+                )
+
+            else:
+
+                if self.brake_slip_active:
+
+                    # Wheel is known to be temporarily under-speeding the
+                    # chassis.  Do not pull chassis speed downward.
+                    applied_correction = 0.0
+                    fused_speed = predicted_speed
+                    wheel_trust = 0.0
+
+                else:
+
+                    applied_correction = clamp(
+                        self.launch_negative_gain
+                        *
+                        max(
+                            wheel_innovation,
+                            -self.negative_wheel_innovation_cap
+                        ),
+                        -self.launch_negative_step,
+                        self.launch_negative_step
+                    )
+
+                    fused_speed = (
+                        predicted_speed
+                        +
+                        applied_correction
+                    )
+
+                    wheel_trust = 1.0
+
+                self.last_accel_wheel_gain = (
+                    self.launch_negative_gain
+                )
+
+                self.last_accel_correction = (
+                    applied_correction
+                )
+
+            # End launch protection only after reaching meaningful racing speed
+            # AND the initial positive-acceleration event has finished.
+            if (
+                fused_speed >= self.launch_exit_speed
+                and
+                accel <= self.positive_accel_threshold
+            ):
+
+                self.launch_exit_accumulator += (
+                    dt
+                )
+
+            else:
+
+                self.launch_exit_accumulator = 0.0
+
+            if (
+                self.launch_exit_accumulator
+                >=
+                self.launch_exit_stable_time
+            ):
+
+                self.launch_mode_active = False
+
+                self.get_logger().info(
+                    'V4 standing-launch protection complete; '
+                    'switching permanently to V3 flying-lap fusion.'
+                )
+
+        # ------------------------------------------------------------------
+        # PROVEN V3 FLYING-LAP FUSION
+        # ------------------------------------------------------------------
+
+        elif (
+            left_fresh
+            and
+            right_fresh
+        ):
+
+            spin_factor = (
+                accel_spin_factor
+            )
+
+            self.last_spin_factor = (
+                spin_factor
+            )
+
+            if accel <= self.positive_accel_threshold:
+
+                if (
+                    self.brake_slip_active
+                    and
+                    wheel_innovation < 0.0
+                ):
+
+                    # Rare wheel-lock/drivetrain-slip condition:
+                    # trust IMU chassis deceleration until wheel recovers.
+                    wheel_trust = 0.0
+                    fused_speed = predicted_speed
+
+                else:
+
+                    # Exact V3 flying-lap fusion outside the slip event.
+                    wheel_trust = 1.0
+
+                    fused_speed = (
+                        predicted_speed
+                        +
+                        self.wheel_correction_gain
+                        *
+                        wheel_innovation
+                    )
+
+            else:
+
+                wheel_trust = (
+                    1.0
+                    -
                     spin_factor
                 )
 
@@ -1205,8 +1830,10 @@ class AckermannOdom(Node):
         else:
 
             wheel_trust = 0.0
-            self.last_wheel_innovation = 0.0
-            fused_speed = predicted_speed
+
+            fused_speed = (
+                predicted_speed
+            )
 
         self.last_wheel_trust = (
             wheel_trust
@@ -1495,6 +2122,10 @@ class AckermannOdom(Node):
             f"spin_excess={self.last_spin_excess:.2f}, "
             f"spin_factor={self.last_spin_factor:.2f}, "
             f"innovation={self.last_wheel_innovation:.2f}, "
+            f"wheel_accel_err={self.last_wheel_accel_error:.2f}, "
+            f"brake_slip={self.brake_slip_active}, "
+            f"launch_innov_factor={self.last_launch_innovation_factor:.2f}, "
+            f"launch_mode={self.launch_mode_active}, "
             f"accel_gain={self.last_accel_wheel_gain:.3f}, "
             f"dv={self.last_accel_correction:.3f}"
         )
